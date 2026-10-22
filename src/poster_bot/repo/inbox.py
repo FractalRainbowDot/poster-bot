@@ -80,35 +80,28 @@ class InboxRepo:
 
     def safe_offset(self) -> int | None:
         """getUpdates offset that discards nothing this process still owes:
-        the smallest pending id minus one, or the highest receipt when the
+        the smallest pending id, or the highest receipt plus one when the
         backlog is empty (None when nothing was ever received)."""
         row = self._conn.execute(
             "SELECT MIN(update_id) AS lo FROM inbox_updates"
             " WHERE done_at IS NULL"
         ).fetchone()
         if row["lo"] is not None:
-            return int(row["lo"]) - 1
+            return int(row["lo"])
         row = self._conn.execute(
             "SELECT MAX(update_id) AS hi FROM inbox_updates"
         ).fetchone()
-        return None if row["hi"] is None else int(row["hi"])
+        return None if row["hi"] is None else int(row["hi"]) + 1
 
     def compact_completed_below_floor(self) -> int:
         """Delete DONE receipts strictly below the durable resume floor.
 
-        The floor is ``safe_offset()`` itself: the offset the poll loop
-        already sent to getUpdates on its last successful fetch and re-derives
-        from this table on every next fetch. Deleting done rows strictly
-        below it preserves every row the floor is derived from (all pending
-        rows, and the highest receipt when nothing is pending), so
-        ``safe_offset()`` is identical before and after compaction -- the
-        resume floor can never regress because of it (monotonic floor).
-
-        Dedup contract: Telegram only ever re-delivers ids above the last
-        offset this process sent, and that offset is never below this floor,
-        so compacted ids can never arrive again and be re-classified NEW by
-        ``begin`` (no stale/replay regression). Pending rows and their
-        reprocessing path are untouched; nothing uncompleted is ever deleted.
+        Telegram returns ids >= the requested offset. Keep every pending
+        row, DONE rows at/above that floor (for redelivery dedup), and the
+        highest receipt as a durable high-water anchor. Without that anchor,
+        an all-DONE table would be emptied and its next offset reset to None.
+        The derived offset is identical before and after compaction, including
+        after a restart. No schema or separate cursor is required.
 
         Returns the number of removed rows. Runs in one transaction so the
         floor read and the delete see the same table state.
@@ -119,7 +112,8 @@ class InboxRepo:
                 return 0
             cur = self._conn.execute(
                 "DELETE FROM inbox_updates"
-                " WHERE done_at IS NOT NULL AND update_id < ?",
+                " WHERE done_at IS NOT NULL AND update_id < ?"
+                " AND update_id < (SELECT MAX(update_id) FROM inbox_updates)",
                 (floor,),
             )
             return cur.rowcount

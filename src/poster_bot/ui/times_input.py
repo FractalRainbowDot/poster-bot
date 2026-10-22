@@ -17,19 +17,30 @@ from ..domain.time import (
     recent_manual_suggestions,
 )
 
-_SHORT = re.compile(r"^(\d{1,2}):(\d{2})$")
+_SHORT = re.compile(r"([0-9]{1,2})[:. -]([0-9]{2})")
+_COMPACT = re.compile(r"([0-9]{1,2})([0-9]{2})")
+_DATE = re.compile(r"([0-9]{2})([-.])([0-9]{2})\2([0-9]{4})")
 _LONG = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{4}) (\d{1,2}):(\d{2})$")
 
 
 def parse_clock(raw: str) -> tuple[int, int] | None:
-    """'hh:mm' text -> (hh, mm) shape check only (calendar-free)."""
-    match = _SHORT.match(raw.strip())
+    """Strict calendar-free clock; compact input splits the last two digits."""
+    text = raw.strip()
+    match = _SHORT.fullmatch(text) or _COMPACT.fullmatch(text)
     if not match:
         return None
     hh, mm = int(match.group(1)), int(match.group(2))
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         return None
     return hh, mm
+
+
+def parse_date(raw: str) -> date:
+    """Separate date-field grammar; cannot accidentally accept a clock."""
+    match = _DATE.fullmatch(raw.strip())
+    if match is None:
+        raise ValueError('invalid date')
+    return date(int(match[4]), int(match[3]), int(match[1]))
 
 
 def resolve_manual_time(

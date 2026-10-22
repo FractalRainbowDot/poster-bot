@@ -9,11 +9,14 @@ minute uniqueness are re-checked at execution inside the domain services.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import date, timedelta
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from ..domain.content import Content, ContentValidationError, Entity
 from ..domain.errors import (
@@ -21,13 +24,12 @@ from ..domain.errors import (
     DomainError,
     MinuteTakenError,
     NonLocalTimeError,
-    NoSlotAvailableError,
     AmbiguousLocalTimeError,
     PastTimeError,
     TransitionError,
 )
 from ..domain.states import Status
-from ..domain.time import Instant, next_free_slot, recent_manual_suggestions
+from ..domain.time import Instant, recent_manual_suggestions
 from ..journal import Journal
 from ..repo.drafts import DraftNotFound, DraftStore
 from ..repo.manual_times import ManualTimesRepo
@@ -42,7 +44,7 @@ from ..repo.settings import (
 )
 from ..transport.ports import DefinitiveFailure, PublishOutcome, Sent, UncertainOutcome
 from .actions import Action, ActionStore, ActionStale
-from .replies import Button, MAX_ROWS, PAGE_SIZE, Reply, nav_rows, page_window
+from .replies import Button, DAY_PAGE_SIZE, MAX_ROWS, PAGE_SIZE, Reply, nav_rows, page_window
 from .state import (
     EffectAlreadyApplied,
     StaleStateError,
@@ -65,6 +67,10 @@ from .times_input import (
     resolve_manual_time,
 )
 from . import texts
+from . import timezones
+from .navigation import NavigationStore
+from .scheduling import SchedulingCards, CARD_ACTIONS
+from .dashboard import Dashboard, snapshot as dashboard_snapshot, summary
 
 PREVIEW_FAIL_RU = {
     "timeout": "таймаут канала",
@@ -105,7 +111,7 @@ class OwnerPreview(Protocol):
     async def send_preview(self, content: Content) -> PublishOutcome: ...
 
 
-class OwnerFlow:
+class OwnerFlow(SchedulingCards):
     # action kinds (server-side only; callback data carries the token alone)
     A_MENU = "menu"
     A_NEW = "new_post"
@@ -117,6 +123,7 @@ class OwnerFlow:
     A_FORWARD_COPY = "forward_copy"
     A_DRAFTS = "drafts"
     A_DRAFT_OPEN = "draft_open"
+    A_DRAFT_SELECT = "draft_select"
     A_DRAFT_PREVIEW = "draft_preview"
     A_DRAFT_EDIT = "draft_edit"
     A_DRAFT_DELETE = "draft_delete"
@@ -125,6 +132,7 @@ class OwnerFlow:
     A_PLAN = "plan"
     A_DAY = "day"
     A_PUB_OPEN = "pub_open"
+    A_PUB_PREVIEW = "pub_preview"
     A_PUB_PAUSE = "pub_pause"
     A_PUB_EDIT_CONTENT = "pub_edit_content"
     A_PUB_EDIT_TIME = "pub_edit_time"
@@ -162,6 +170,7 @@ class OwnerFlow:
         journal: Journal,
         preview: OwnerPreview,
         channel_id: int,
+        channel_username: str | None = None,
         state: UiStateRepo | None = None,
         actions: ActionStore | None = None,
     ) -> None:
@@ -173,11 +182,36 @@ class OwnerFlow:
         self._manual_times = manual_times
         self._journal = journal
         self._preview = preview
+        # resolved numeric destination (a configured @username arrives already
+        # resolved); the bare username only builds correct public t.me links
+        if isinstance(channel_id, bool) or not isinstance(channel_id, int):
+            raise ValueError("channel_id must be a resolved numeric chat id")
         self._channel_id = channel_id
+        username = (channel_username or "").strip().removeprefix("@").strip()
+        self._channel_username = username or None
         self._state = state or UiStateRepo(conn)
         self._actions = actions or ActionStore(conn)
 
     # ------------------------------------------------------------------ core
+    def navigation_store(self, owner_id: int) -> NavigationStore:
+        return NavigationStore(self._conn, owner_id)
+
+    def input_captured(self, source_key: str) -> bool:
+        """A durable intake receipt, not merely a successful UI response."""
+        return self._state.has_effect(source_key)
+
+    async def menu_navigation(self, *, label: str, now: int) -> Reply:
+        """Stable reply-keyboard commands, independent of consumed tokens."""
+        if label == texts.MENU_NEW_POST:
+            return await self.new_post(now=now)
+        if label in (texts.MENU_DRAFTS, texts.LEGACY_MENU_DRAFTS):
+            return self.drafts_view(now=now, page=0)
+        if label == texts.MENU_PLAN:
+            return self.plan_today(now=now)
+        if label == texts.MENU_SETTINGS:
+            return self.settings_view(now=now)
+        return await self.command_start(now=now)
+
     def _ui(self) -> UiState:
         return self._state.get()
 
@@ -201,20 +235,42 @@ class OwnerFlow:
         return self._actions.create(action, now_epoch=now, **kw)
 
     def _btn(self, label: str, action: str, *, now: int, **kw) -> Button:
+        if action in (self.A_SCHED_NEXT, self.A_SCHED_OWN, self.A_SCHED_RECENT):
+            kw.setdefault('expected_version', self._ui().version)
         return Button(label, self._token(action, now=now, **kw))
 
     def _menu_reply(self, now: int) -> Reply:
-        rows = tuple(
-            (self._btn(label, act, now=now),)
-            for label, act in (
-                (texts.MENU_NEW_POST, self.A_NEW),
-                (texts.MENU_DRAFTS, self.A_DRAFTS),
-                (texts.MENU_PLAN, self.A_PLAN),
-                (texts.MENU_SETTINGS, self.A_SETTINGS),
-                (texts.MENU_JOURNAL, self.A_JOURNAL),
-            )
-        )
-        return Reply(texts.MENU_TEXT, rows)
+        ui = self._ui()
+        if ui.state is not State.MENU or ui.payload:
+            # Intake replay/error replies must remain neutral and must not
+            # impersonate a main dashboard over a draft or an unfinished form.
+            return Reply(texts.MENU_TEXT, self._menu_rows(now))
+        return self.dashboard_reply(now=now, snapshot=self.dashboard_snapshot())
+
+    def dashboard_snapshot(self) -> Dashboard:
+        return dashboard_snapshot(self._publications, self._dispatch,
+                                  self._settings.get().timezone)
+
+    def dashboard_current(self, version: int) -> bool:
+        ui = self._ui()
+        return ui.state is State.MENU and not ui.payload and ui.version == version
+
+    def dashboard_reply(self, *, now: int, snapshot: Dashboard) -> Reply:
+        """Render without resetting the conversation; only changed frames issue tokens."""
+        entries = [self._btn(
+            entry.label, self.A_PUB_OPEN, now=now,
+            publication_id=entry.publication_id, expected_version=entry.version,
+            arg=f'row:{self._ui().version}',
+        ) for entry in snapshot.entries]
+        rows = [(entry,) for entry in entries]
+        rows.extend(self._menu_rows(now))
+        return Reply(snapshot.text, tuple(rows), dashboard=snapshot,
+                     dashboard_version=self._ui().version)
+
+    def _menu_rows(self, now: int) -> tuple[tuple[Button, ...], ...]:
+        # The four primary destinations live on the persistent reply keyboard.
+        # Journal has no persistent duplicate, so keep its existing callback.
+        return ((self._btn(texts.MENU_JOURNAL, self.A_JOURNAL, now=now),),)
 
     def _explain(self, exc: DomainError) -> str:
         return str(exc)
@@ -256,6 +312,17 @@ class OwnerFlow:
             # a redelivered message must never reset or overwrite the newer
             # conversation step it lands in (PLAN §6 at-least-once)
             return self._replay_reply(now=now)
+        if (ui.state is State.MANUAL_TIME and ui.arg('time_form')) or (
+            ui.state is State.DRAFT and ui.arg('schedule_picker')
+        ):
+            try:
+                if ui.state is State.DRAFT:
+                    return self._text_schedule_picker(now=now, ui=ui, text=text,
+                                                      source_key=source_key)
+                return await self._text_time_form(now=now, ui=ui, text=text,
+                                                  source_key=source_key)
+            except EffectAlreadyApplied:
+                return self._replay_reply(now=now)
         handler = {
             State.CREATING: self._text_creating,
             State.EDITING: self._text_editing,
@@ -278,7 +345,10 @@ class OwnerFlow:
                 return self._replay_reply(now=now)
             except ContentValidationError as exc:
                 return self.content_rejected(now=now, exc=exc)
-        return await handler(now=now, ui=ui, text=text, entities=entities)
+        reply = await handler(now=now, ui=ui, text=text, entities=entities)
+        if reply.input_accepted and source_key is not None:
+            self._state.record_effect(source_key, now_epoch=now)
+        return reply
 
     async def media(self, *, now: int, kind: str, file_id: str,
                     caption: str | None,
@@ -301,9 +371,7 @@ class OwnerFlow:
             return self.content_rejected(now=now, exc=exc)
         try:
             if result == "ignored_in_album":
-                self._state.set(ui.state, self._staged_payload(staged, ui),
-                                expected_version=ui.version, now_epoch=now,
-                                effect_key=source_key)
+                # Not captured: leave the source visible with explicit feedback.
                 return Reply(
                     "Элемент альбома другого типа (не фото/видео) пропущен: альбом "
                     "собирает только фото и видео."
@@ -413,6 +481,13 @@ class OwnerFlow:
         idempotent answer rebuilt from the committed conversation — never a
         second effect, never a false conflict (PLAN §6 at-least-once)."""
         ui = self._ui()
+        if ui.state is State.MANUAL_TIME and ui.arg('time_form'):
+            return self._time_form_view(now=now)
+        if ui.state is State.DRAFT and ui.arg('hours'):
+            hours = ui.arg('hours')
+            return self._hours_view(now=now, post_id=ui.arg('post_id'),
+                                    day=date.fromisoformat(hours['day']),
+                                    page=hours['page'], persist=False)
         if ui.state is State.AWAIT_REPLACE:
             pending_caption = ui.arg("pending_caption")
             if isinstance(pending_caption, dict):
@@ -465,7 +540,7 @@ class OwnerFlow:
         if staged.kind == "album" and staged.ignored_group_items:
             extra = f" Пропущено неподдерживаемых элементов: {staged.ignored_group_items}."
         return Reply(
-            f"В черновике: {label} ({count}). {texts.BTN_CONTINUE} — когда всё "
+            f"В посте: {label} ({count}). {texts.BTN_CONTINUE} — когда всё "
             f"придёт.{extra}",
             self._staged_rows(self._ui(), now, staged=staged),
         )
@@ -648,11 +723,37 @@ class OwnerFlow:
         if ui.state not in (State.CREATING, State.EDITING) or staged.kind != "forward":
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
-        copy = staged.as_copy()
-        self._state.set(ui.state, {"staged": copy.to_dict()},
+        copy = staged.copy
+        try:
+            # A nonempty branch is not proof of a usable or complete copy:
+            # unsupported album items are omitted during candidate intake.
+            # Validate the actual payload AND account for every source before
+            # replacing durable coordinates or releasing any source to cleanup.
+            if copy is None or copy.empty:
+                raise ContentValidationError("no editable copy")
+            content = copy.build()
+            retained = len(content.items) if content.kind == "album" else 1
+            if content.mode != "copy" or retained != len(staged.forward_ids):
+                raise ContentValidationError("incomplete editable copy")
+        except ContentValidationError:
+            rows = (
+                (self._btn(texts.BTN_FORWARD_AS_IS, self.A_FORWARD_AS_IS, now=now),),
+                (self._btn(texts.BTN_MAKE_COPY, self.A_FORWARD_COPY, now=now),),
+            ) + self._staged_rows(ui, now, staged=staged)
+            return Reply(
+                "Невозможно создать полную редактируемую копию этого содержимого. "
+                "Источник сохранён: можно переслать как есть или нажать «Продолжить». "
+                "Не удаляйте сообщения источника.", rows,
+            )
+        self._state.set(ui.state, self._staged_payload(copy, ui),
                         expected_version=ui.version, now_epoch=now)
         reply = self._staged_reply(now=now, staged=copy)
-        return Reply(f"{texts.COPY_READY} {reply.text}", reply.rows)
+        # These coordinates come from durable intake, never callback data.
+        # Validated file IDs/text now survive source deletion in explicit copy mode.
+        released = tuple((int(staged.forward_chat_id), mid)
+                         for mid in staged.forward_ids)
+        return Reply(f"{texts.COPY_READY} {reply.text}", reply.rows,
+                     released_inputs=released)
 
     # ------------------------------------------------------------------- drafts
     def drafts_view(self, *, now: int, page: int) -> Reply:
@@ -661,14 +762,17 @@ class OwnerFlow:
         if not ids:
             self._go(State.MENU, {"view": "drafts"}, now=now)
             return Reply(texts.NO_DRAFTS, ((self._btn(texts.BTN_BACK, self.A_BACK, now=now),),))
+        ui = self._go(State.MENU, {"view": "drafts"}, now=now)
         rows = []
         for pid in ids[start:end]:
             try:
-                line = self._content_line(self._drafts.get_content(pid))
+                content = self._drafts.get_content(pid)
+                line = self._content_line(content)
             except DraftNotFound:
-                line = "—"
-            rows.append((self._btn(f"№{pid} · {line}", self.A_DRAFT_OPEN,
-                                   now=now, post_id=pid),))
+                continue
+            rows.append((self._btn(f"№{pid} · {line}", self.A_DRAFT_SELECT,
+                                   now=now, post_id=pid, expected_version=ui.version,
+                                   arg=self._draft_snapshot(content)),))
         nav = []
         if page > 0:
             nav.append(self._btn("← Пред.", self.A_DRAFTS, now=now,
@@ -678,12 +782,34 @@ class OwnerFlow:
                                  arg=f"p{page + 1}"))
         nav.append(self._btn(texts.BTN_BACK, self.A_BACK, now=now))
         rows.append(tuple(nav))
-        self._go(State.MENU, {"view": "drafts"}, now=now)
         return Reply(f"{texts.TITLE_DRAFTS} ({start + 1}–{end} из {len(ids)})",
                      tuple(rows[:MAX_ROWS]))
 
     def draft_open(self, *, now: int, post_id: int) -> Reply:
         return self._draft_view(now=now, post_id=post_id)
+
+    @staticmethod
+    def _draft_snapshot(content: Content) -> str:
+        # Posts have no version field. Bind the server-side capability to the
+        # immutable payload instead, without storing another copy of its text.
+        return hashlib.sha256(content.to_json().encode()).hexdigest()
+
+    def _draft_preview_valid(self, action: Action) -> bool:
+        ui = self._ui()
+        if action.expected_version != ui.version:
+            return False
+        if action.action == self.A_DRAFT_SELECT:
+            if ui.state is not State.MENU or ui.arg("view") != "drafts":
+                return False
+        elif ui.state is not State.DRAFT or ui.arg("post_id") != action.post_id:
+            return False
+        if not self._drafts.is_draft(action.post_id):
+            return False
+        try:
+            content = self._drafts.get_content(action.post_id)
+        except DraftNotFound:
+            return False
+        return action.arg == self._draft_snapshot(content)
 
     async def draft_preview(self, *, now: int, post_id: int) -> Reply:
         try:
@@ -728,7 +854,7 @@ class OwnerFlow:
             (self._btn(texts.BTN_BACK, self.A_DRAFT_OPEN, now=now,
                        post_id=post_id),),
         )
-        return Reply(f"{texts.DRAFT_DELETE_ASK} Черновик №{post_id}.", rows)
+        return Reply(f"{texts.DRAFT_DELETE_ASK} Отложенный пост №{post_id}.", rows)
 
     def draft_delete_yes(self, *, now: int, post_id: int) -> Reply:
         try:
@@ -762,14 +888,15 @@ class OwnerFlow:
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
         self._go(State.DRAFT, {"post_id": post_id}, now=now)
         line = self._content_line(content)
-        text = f"Черновик №{post_id}. Содержимое: {line}."
+        text = f"Отложенный пост №{post_id}. Содержимое: {line}."
         if note:
             text = f"{note}\n{text}"
         rows = (
             (self._btn(texts.BTN_SCHEDULE, self.A_DRAFT_SCHEDULE, now=now,
                        post_id=post_id),),
             (self._btn(texts.BTN_PREVIEW, self.A_DRAFT_PREVIEW, now=now,
-                       post_id=post_id),),
+                       post_id=post_id, expected_version=self._ui().version,
+                       arg=self._draft_snapshot(content)),),
             (self._btn(texts.BTN_EDIT_CONTENT, self.A_DRAFT_EDIT, now=now,
                        post_id=post_id),),
             (self._btn(texts.BTN_DELETE, self.A_DRAFT_DELETE, now=now,
@@ -791,6 +918,11 @@ class OwnerFlow:
         return self._schedule_picker(now=now, post_id=post_id)
 
     def _schedule_picker(self, *, now: int, post_id: int) -> Reply:
+        ui = self._ui()
+        if not (ui.state is State.DRAFT and ui.arg('post_id') == post_id
+                and ui.arg('schedule_picker')):
+            self._go(State.DRAFT, {'post_id': post_id, 'schedule_picker': True},
+                     now=now, expected_version=ui.version)
         settings = self._settings.get()
         rows = [
             (self._btn(texts.BTN_NEXT_SLOT, self.A_SCHED_NEXT, now=now,
@@ -816,30 +948,15 @@ class OwnerFlow:
         if ui.state is not State.DRAFT or ui.arg("post_id") != post_id:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
-        settings = self._settings.get()
-        try:
-            instant = next_free_slot(now, settings.timezone,
-                                     settings.start_hour, settings.end_hour,
-                                     self._publications.reserved_minutes())
-        except NoSlotAvailableError:
-            return Reply(texts.NO_SLOT,
-                         self._schedule_picker(now=now, post_id=post_id).rows)
-        return self._confirm_schedule_view(now=now, post_id=post_id,
-                                           instant=instant)
+        return self._hours_view(now=now, post_id=post_id)
 
     def sched_own(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
         post_id = action.post_id
-        if ui.state is not State.DRAFT or ui.arg("post_id") != post_id:
+        if ui.state not in (State.DRAFT, State.CONFIRM_SCHEDULE) or ui.arg("post_id") != post_id:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
-        settings = self._settings.get()
-        self._go(State.MANUAL_TIME, {"purpose": "schedule", "post_id": post_id},
-                 now=now)
-        return self._time_ask_reply(now=now, settings=settings,
-                                    back=Button(texts.BTN_BACK, self._token(
-                                        self.A_DRAFT_OPEN, now=now,
-                                        post_id=post_id)))
+        return self._start_time_form(now=now, payload={"purpose": "schedule", "post_id": post_id})
 
     def sched_recent(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
@@ -886,7 +1003,8 @@ class OwnerFlow:
             payload["manual_hh"], payload["manual_mm"] = manual
         self._go(State.CONFIRM_SCHEDULE, payload, now=now)
         token = self._token(self.A_CONFIRM, now=now, post_id=post_id,
-                            minute_epoch=instant.epoch)
+                            minute_epoch=instant.epoch,
+                            expected_version=self._ui().version)
         rows = (
             (Button(texts.BTN_CONFIRM, token),),
             (self._btn(texts.BTN_OWN_TIME, self.A_SCHED_OWN, now=now,
@@ -912,6 +1030,8 @@ class OwnerFlow:
         ):
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
+        if minute <= now:
+            return self._expired_time_confirmation(now=now, ui=ui, minute=minute)
         try:
             pub = self._publications.schedule(post_id, Instant(minute),
                                               now_epoch=now)
@@ -919,6 +1039,7 @@ class OwnerFlow:
                 DomainError) as exc:
             reason = self._schedule_refusal_ru(exc)
             if isinstance(exc, (MinuteTakenError, PastTimeError)):
+                self._go(State.DRAFT, {"post_id": post_id}, now=now)
                 return Reply(f"{reason}\n{texts.PICK_TIME}",
                              self._schedule_picker(now=now, post_id=post_id).rows)
             self._go(State.MENU, {}, now=now)
@@ -941,6 +1062,19 @@ class OwnerFlow:
             return texts.ALREADY_PUB_RU
         return texts.CONFIRM_BAD_TIME
 
+    def _expired_time_confirmation(self, *, now: int, ui: UiState,
+                                   minute: int) -> Reply:
+        # Keep the selected wall date/time editable, without calling a service
+        # whose due-minute tolerance belongs to the sender, not this UI.
+        local = Instant(minute).local(self._settings.get().timezone)
+        payload = dict(ui.payload)
+        payload.pop("minute_epoch", None)
+        payload["purpose"] = (ui.arg("purpose") or "schedule").removesuffix("_confirm")
+        payload["time_form"] = {"date": local.date().isoformat(),
+                                "time": local.strftime("%H:%M"), "field": None}
+        self._go(State.MANUAL_TIME, payload, now=now)
+        return self._time_form_view(now=now, note=texts.TIME_NOT_FUTURE)
+
     # -------------------------------------------------- manual time text input
     async def _text_manual_time(self, *, now: int, ui: UiState, text: str,
                                 entities: tuple[Entity, ...]) -> Reply:
@@ -958,13 +1092,15 @@ class OwnerFlow:
                          f"{settings.timezone}).", ())
         purpose = ui.arg("purpose")
         if purpose == "schedule":
-            return self._confirm_schedule_view(now=now,
-                                               post_id=int(ui.arg("post_id")),
-                                               instant=instant, manual=(hh, mm))
+            return replace(self._confirm_schedule_view(now=now,
+                                                post_id=int(ui.arg("post_id")),
+                                                instant=instant, manual=(hh, mm)),
+                           input_accepted=True)
         if purpose in ("edit_time", "replan"):
-            return self._confirm_minute_change_view(now=now, ui=ui,
-                                                    instant=instant,
-                                                    manual=(hh, mm))
+            return replace(self._confirm_minute_change_view(now=now, ui=ui,
+                                                     instant=instant,
+                                                     manual=(hh, mm)),
+                           input_accepted=True)
         self._go(State.MENU, {}, now=now)
         return self._menu_reply(now)
 
@@ -986,7 +1122,7 @@ class OwnerFlow:
         )
         token = self._token(kind, now=now, publication_id=pub_id,
                             expected_version=expected_version,
-                            minute_epoch=instant.epoch)
+                            minute_epoch=instant.epoch, arg=f'ui:{self._ui().version}')
         rows = (
             (Button(texts.BTN_CONFIRM, token),),
             (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
@@ -1008,6 +1144,8 @@ class OwnerFlow:
         ):
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
+        if minute <= now:
+            return self._expired_time_confirmation(now=now, ui=ui, minute=minute)
         try:
             pub = self._publications.edit_time(pub_id, action.expected_version,
                                                Instant(minute), now_epoch=now)
@@ -1035,6 +1173,8 @@ class OwnerFlow:
         ):
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
+        if minute <= now:
+            return self._expired_time_confirmation(now=now, ui=ui, minute=minute)
         try:
             pub = self._publications.replan(pub_id, action.expected_version,
                                             Instant(minute), now_epoch=now)
@@ -1072,22 +1212,20 @@ class OwnerFlow:
         settings = self._settings.get()
         start, end = day_bounds(day, settings.timezone)
         pubs = self._publications.scheduled_between(start, end)
-        start_i, end_i, pages = page_window(len(pubs), page)
+        start_i, end_i, pages = page_window(len(pubs), page, size=DAY_PAGE_SIZE)
+        ui = self._go(State.MENU, {"view": "day"}, now=now)
         rows = []
         for pub in pubs[start_i:end_i]:
-            row = [self._btn(
-                f"{self._pub_time_local(pub)} · {texts.STATUS_RU[pub.status]}"
-                f" · №{pub.id}",
+            when = pub.scheduled_at.astimezone(ZoneInfo(settings.timezone)).strftime("%H:%M")
+            status = texts.status_marker(pub.status)
+            excerpt = summary(self._dispatch.content_for_publication(pub.id))
+            rows.append((self._btn(
+                f"{when} | {status} | {excerpt}",
                 self.A_PUB_OPEN, now=now, publication_id=pub.id,
-            )]
-            if pub.status is Status.PUBLISHED:
-                link = self._last_permalink(pub.post_id)
-                if link:
-                    row.append(Button(texts.BTN_LINK, url=link))
-            rows.append(tuple(row))
+                expected_version=pub.version, arg=f'row:{ui.version}',
+            ),))
         rows.extend(self._day_nav_rows(now=now, day=day, page=page,
                                        pages=pages))
-        self._go(State.MENU, {"view": "day"}, now=now)
         head = f"{texts.PLAN_DAY_PREFIX}{day.strftime('%d.%m.%Y')} " \
                f"({settings.timezone})"
         if not pubs:
@@ -1153,6 +1291,10 @@ class OwnerFlow:
         rows: list[tuple[Button, ...]] = []
         add = rows.append
         st = pub.status
+        if st in (Status.SCHEDULED, Status.SUSPENDED, Status.MISSED, Status.UNCERTAIN,
+                  Status.PUBLISHED):
+            add((self._btn(texts.BTN_PREVIEW, self.A_PUB_PREVIEW, now=now,
+                           publication_id=pub.id, expected_version=pub.version),))
         if st is Status.SCHEDULED:
             add((self._btn(texts.BTN_PAUSE, self.A_PUB_PAUSE, now=now,
                            publication_id=pub.id, expected_version=pub.version),))
@@ -1177,8 +1319,6 @@ class OwnerFlow:
             link = self._last_permalink(pub.post_id)
             if link:
                 add((Button(texts.BTN_LINK, url=link),))
-            add((self._btn(texts.BTN_DELETE, self.A_PUB_DELETE, now=now,
-                           publication_id=pub.id, post_id=pub.post_id),))
         if st is Status.UNCERTAIN:
             add((self._btn(texts.BTN_MARK_PUBLISHED, self.A_MARK_PUBLISHED,
                            now=now, publication_id=pub.id,
@@ -1196,6 +1336,22 @@ class OwnerFlow:
     # ------------------------------------------------- publication management
     def pub_open(self, *, now: int, pub_id: int) -> Reply:
         return self._publication_view(now=now, pub_id=pub_id)
+
+    async def pub_preview(self, *, now: int, pub_id: int) -> Reply:
+        # Read the actual payload bound to this publication.
+        # No claim, scheduling mutation or source cleanup belongs in this path.
+        try:
+            content = self._dispatch.content_for_publication(pub_id)
+        except DomainError:
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        outcome = await self._preview.send_preview(content)
+        if isinstance(outcome, Sent):
+            note = texts.PREVIEW_SENT
+        else:
+            code = getattr(outcome, "code", "api_error")
+            reason = PREVIEW_FAIL_RU.get(code, code)
+            note = f"{texts.PREVIEW_FAILED_PREFIX}{reason}. {texts.PUB_PREVIEW_RETRY_HINT}"
+        return self._publication_view(now=now, pub_id=pub_id, note=note)
 
     def pub_pause(self, *, now: int, action: Action) -> Reply:
         pub_id = int(action.publication_id)
@@ -1236,12 +1392,9 @@ class OwnerFlow:
         if ui.state is not State.PUBLICATION or ui.arg("pub_id") != pub_id:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
-        settings = self._settings.get()
-        self._go(State.MANUAL_TIME,
-                 {"purpose": "edit_time", "pub_id": pub_id,
-                  "expected_version": int(action.expected_version)}, now=now)
-        return Reply(f"{texts.TIME_ASK}{settings.timezone}).",
-                     ((self._btn(texts.BTN_BACK, self.A_BACK, now=now),),))
+        return self._start_time_form(now=now, payload={
+            "purpose": "edit_time", "pub_id": pub_id,
+            "expected_version": int(action.expected_version)})
 
     def pub_resume(self, *, now: int, action: Action) -> Reply:
         pub_id = int(action.publication_id)
@@ -1310,12 +1463,9 @@ class OwnerFlow:
         if ui.state is not State.PUBLICATION or ui.arg("pub_id") != pub_id:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
-        settings = self._settings.get()
-        self._go(State.MANUAL_TIME,
-                 {"purpose": "replan", "pub_id": pub_id,
-                  "expected_version": int(action.expected_version)}, now=now)
-        return Reply(f"{texts.TIME_ASK}{settings.timezone}).",
-                     ((self._btn(texts.BTN_BACK, self.A_BACK, now=now),),))
+        return self._start_time_form(now=now, payload={
+            "purpose": "replan", "pub_id": pub_id,
+            "expected_version": int(action.expected_version)})
 
     def _pub_refusal_ru(self, exc: DomainError) -> str:
         if isinstance(exc, TransitionError):
@@ -1365,8 +1515,9 @@ class OwnerFlow:
             return self._publication_view(
                 now=now, pub_id=pub_id,
                 note=f"{texts.OP_FAILED_PREFIX}{self._pub_refusal_ru(exc)}")
-        return self._publication_view(now=now, pub_id=pub_id,
-                                      note=texts.MARKED_PUBLISHED)
+        return replace(self._publication_view(now=now, pub_id=pub_id,
+                                      note=texts.MARKED_PUBLISHED),
+                       input_accepted=True)
 
     def _parse_channel_ref(self, text: str) -> int | None:
         raw = text.strip()
@@ -1379,6 +1530,10 @@ class OwnerFlow:
         return None
 
     def _channel_permalink(self, message_id: int) -> str:
+        # public channel: the configured username produces the canonical
+        # t.me/<username>/<id> link; numeric targets fall back to t.me/c
+        if self._channel_username:
+            return f"https://t.me/{self._channel_username}/{message_id}"
         raw = str(abs(int(self._channel_id)))
         if raw.startswith("100"):
             raw = raw[3:]
@@ -1455,6 +1610,8 @@ class OwnerFlow:
 
     def settings_edit(self, *, now: int, action: Action) -> Reply:
         key = action.arg
+        if key == KEY_TZ:
+            return self.timezone_view(now=now)
         if key not in (KEY_TZ, KEY_START, KEY_END):
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
@@ -1473,6 +1630,9 @@ class OwnerFlow:
     async def _text_settings_input(self, *, now: int, ui: UiState, text: str,
                                    entities: tuple[Entity, ...]) -> Reply:
         key = ui.arg("key")
+        if key == KEY_TZ and ui.arg("tz_picker"):
+            return replace(self.timezone_view(now=now, query=text.strip()),
+                           input_accepted=True)
         if key not in (KEY_TZ, KEY_START, KEY_END):
             self._go(State.MENU, {}, now=now)
             return self._menu_reply(now)
@@ -1487,7 +1647,43 @@ class OwnerFlow:
             )
         self._journal.record("settings_changed", keys_changed=key,
                              now_epoch=now)
-        return self.settings_view(now=now)
+        return replace(self.settings_view(now=now), input_accepted=True)
+
+    def timezone_view(self, *, now: int, page: int | None = None,
+                      all_zones: bool = False, query: str = "") -> Reply:
+        current = self._settings.get().timezone
+        zones = timezones.choices(all_zones=all_zones, query=query)
+        if not query and current not in zones:
+            zones.append(current)
+        if page is None:
+            page = zones.index(current) // timezones.PAGE_SIZE if current in zones else 0
+        pages = max(1, (len(zones) + timezones.PAGE_SIZE - 1) // timezones.PAGE_SIZE)
+        page = min(max(0, page), pages - 1)
+        ui = self._go(State.SETTINGS_INPUT,
+                      {"key": KEY_TZ, "tz_picker": True, "tz_query": query,
+                       "tz_all": all_zones}, now=now)
+        rows = [(self._btn(timezones.label(zone, current=current, now=now),
+                           "tz_choose", now=now, arg=zone,
+                           expected_version=ui.version),)
+                for zone in zones[page * timezones.PAGE_SIZE:
+                                  (page + 1) * timezones.PAGE_SIZE]]
+        nav = []
+        for target, title in ((page - 1, "← Пред."), (page + 1, "След. →")):
+            if 0 <= target < pages:
+                nav.append(self._btn(title, "tz_page", now=now, arg=str(target),
+                                     expected_version=ui.version))
+        if nav:
+            rows.append(tuple(nav))
+        rows.append((self._btn("Все пояса IANA", "tz_all", now=now,
+                               expected_version=ui.version),
+                     self._btn("Ввести IANA вручную", "tz_manual", now=now,
+                               expected_version=ui.version)))
+        rows.append((self._btn(texts.BTN_BACK, self.A_SETTINGS, now=now),))
+        return Reply(
+            f"Часовой пояс · {page + 1}/{pages}\n"
+            f"Текущий: {current} ({timezones.label(current, current=current, now=now)})\n"
+            "Выберите город или пришлите название города / часть IANA для поиска."
+            + ("\nНичего не найдено." if not zones else ""), tuple(rows))
 
     # ---------------------------------------------------------------- journal
     def journal_view(self, *, now: int, page: int) -> Reply:
@@ -1538,15 +1734,101 @@ class OwnerFlow:
         return " · ".join(parts)
 
     # ------------------------------------------------------------ press routing
-    async def press(self, *, now: int, token: str) -> Reply:
+    async def press(self, *, now: int, token: str,
+                    on_consumed: Callable[[], Awaitable[None]] | None = None,
+                    refresh_now: Callable[[], int] | None = None) -> Reply:
         try:
             action = self._actions.consume(token, now_epoch=now)
         except ActionStale:
-            return Reply(texts.BUTTON_STALE, ())
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        ui = self._ui()
+        if action.action == self.A_PUB_OPEN and action.expected_version is not None:
+            if (action.arg != f'row:{ui.version}' or ui.state is not State.MENU
+                    or ui.arg('view') not in (None, 'day')):
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+            try:
+                pub = self._publications.get(action.publication_id)
+            except DomainError:
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+            if pub.version != action.expected_version:
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if (ui.arg('time_form') or ui.arg('hours')) and action.action not in CARD_ACTIONS:
+            # Inline buttons from an older screen cannot replace a live card.
+            # The persistent reply keyboard still navigates via menu_navigation.
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if action.action in CARD_ACTIONS | {self.A_SCHED_NEXT, self.A_SCHED_OWN,
+                                           self.A_SCHED_RECENT, self.A_CONFIRM}:
+            if action.expected_version != self._ui().version:
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if action.action in (self.A_CONFIRM_TIME_EDIT, self.A_CONFIRM_REPLAN):
+            if action.arg != f'ui:{self._ui().version}':
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if action.action in ("tz_choose", "tz_page", "tz_all", "tz_manual"):
+            ui = self._ui()
+            if (ui.state != State.SETTINGS_INPUT or not ui.arg("tz_picker")
+                    or action.expected_version != ui.version):
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if action.action in (self.A_DRAFT_SELECT, self.A_DRAFT_PREVIEW):
+            if not self._draft_preview_valid(action):
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if action.action == self.A_PUB_PREVIEW:
+            if (ui.state is not State.PUBLICATION
+                    or ui.arg("pub_id") != action.publication_id):
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+            try:
+                pub = self._publications.get(action.publication_id)
+            except DomainError:
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+            if (pub.version != action.expected_version or pub.status not in (
+                    Status.SCHEDULED, Status.SUSPENDED, Status.MISSED, Status.UNCERTAIN,
+                    Status.PUBLISHED)):
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        # Acknowledge validated callbacks before potentially slow previews.
+        # Stale tokens return above and get one explanatory toast instead.
+        if on_consumed is not None:
+            await on_consumed()
+        # Acknowledgement is network I/O and can cross the selected minute.
+        # Direct/offline callers retain their explicit deterministic `now`.
+        if refresh_now is not None:
+            now = refresh_now()
         return await self._run_action(now=now, action=action)
 
     async def _run_action(self, *, now: int, action: Action) -> Reply:
         kind = action.action
+        if kind in (self.A_DRAFT_SELECT, self.A_DRAFT_PREVIEW):
+            if not self._draft_preview_valid(action):
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+            return await self.draft_preview(now=now, post_id=action.post_id)
+        if kind in (self.A_PUB_OPEN, self.A_PUB_PREVIEW) and action.expected_version is not None:
+            # The acknowledgement itself awaited network I/O. Recheck the
+            # capability before sending content if the publication changed.
+            try:
+                current = self._publications.get(action.publication_id)
+            except DomainError:
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+            if current.version != action.expected_version:
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if kind in CARD_ACTIONS:
+            return self._card_action(now=now, action=action)
+        if kind in ("tz_choose", "tz_page", "tz_all", "tz_manual"):
+            ui = self._ui()
+            if kind == "tz_choose":
+                try:
+                    self._settings.change(**{KEY_TZ: action.arg})
+                except SettingsError:
+                    return Reply(texts.SETTINGS_BAD_TZ)
+                self._journal.record("settings_changed", keys_changed=KEY_TZ,
+                                     now_epoch=now)
+                return self.settings_view(now=now)
+            if kind == "tz_manual":
+                self._go(State.SETTINGS_INPUT, {"key": KEY_TZ}, now=now)
+                return Reply(texts.SETTINGS_VALUE_ASK + " Пример: Europe/Moscow.",
+                             ((self._btn(texts.BTN_BACK, self.A_SET_TZ,
+                                         now=now, arg=KEY_TZ),),))
+            return self.timezone_view(
+                now=now, page=int(action.arg or 0) if kind == "tz_page" else 0,
+                all_zones=kind == "tz_all" or ui.arg("tz_all", False),
+                query=ui.arg("tz_query", "") if kind == "tz_page" else "")
         if kind == self.A_MENU:
             return await self.command_start(now=now)
         if kind == self.A_NEW:
@@ -1595,7 +1877,17 @@ class OwnerFlow:
             day_iso, page = self._day_arg(action.arg)
             return self.plan_day(now=now, day_iso=day_iso, page=page)
         if kind == self.A_PUB_OPEN and action.publication_id is not None:
-            return self.pub_open(now=now, pub_id=action.publication_id)
+            if action.arg is None:
+                return self.pub_open(now=now, pub_id=action.publication_id)
+            pub = self._publications.get(action.publication_id)
+            if pub.status is Status.SENDING:
+                return self.pub_open(now=now, pub_id=pub.id)
+            # Leave the dashboard before awaiting the preview, so its periodic
+            # refresh cannot publish a competing menu card during this action.
+            self._go(State.PUBLICATION, {"pub_id": pub.id}, now=now)
+            return await self.pub_preview(now=now, pub_id=pub.id)
+        if kind == self.A_PUB_PREVIEW and action.publication_id is not None:
+            return await self.pub_preview(now=now, pub_id=action.publication_id)
         if kind == self.A_PUB_PAUSE and action.publication_id is not None:
             return self.pub_pause(now=now, action=action)
         if kind == self.A_PUB_EDIT_CONTENT and action.publication_id is not None:
@@ -1629,7 +1921,7 @@ class OwnerFlow:
         if kind == self.A_BACK:
             self._state.reset_to_menu(now_epoch=now)
             return self._menu_reply(now)
-        return Reply(texts.BUTTON_STALE, ())
+        return Reply(texts.BUTTON_STALE, (), stale_callback=True)
 
     @staticmethod
     def _page_of(arg: str | None) -> int:

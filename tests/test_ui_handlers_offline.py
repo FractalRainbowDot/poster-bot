@@ -7,17 +7,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pytest
 from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import TelegramMethod
 from aiogram.methods.base import TelegramType
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, Update
 
-from conftest import NOW, Services
+from conftest import NOW, Services, text_content
 from ui_flow_helpers import FLOW_CHANNEL, build_flow
 from poster_bot.ui import handlers
 from poster_bot.ui.replies import TEXT_MAX, Button, Reply
@@ -210,6 +212,12 @@ class _FakeApiSession(BaseSession):
         super().__init__()
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self._next_id = 900
+        self.edit_error: str | None = None
+        self.answer_error: str | None = None
+        self.send_error: str | None = None
+        self.visible: dict[int, dict[str, Any]] = {}
+        self.before_delete = None
+        self.before_answer = None
 
     async def close(self) -> None:
         pass
@@ -231,12 +239,41 @@ class _FakeApiSession(BaseSession):
             fallback=lambda obj: str(obj),
         )
         self.requests.append((api_method, payload))
+        if api_method == "answerCallbackQuery" and self.before_answer:
+            self.before_answer()
+        if api_method == "sendMessage" and self.send_error:
+            error, self.send_error = self.send_error, None
+            raise TelegramBadRequest(method=method, message=error)
+        if api_method == "answerCallbackQuery" and self.answer_error:
+            error, self.answer_error = self.answer_error, None
+            raise TelegramBadRequest(method=method, message=error)
+        if api_method == "editMessageText" and self.edit_error:
+            error, self.edit_error = self.edit_error, None
+            raise TelegramBadRequest(method=method, message=error)
         if api_method in {"answerCallbackQuery", "deleteMessage"}:
             raw: Any = True
         elif api_method == "sendMediaGroup":
             raw = [self._raw(), self._raw()]
+        elif api_method in {"forwardMessages", "copyMessages"}:
+            raw = [{"message_id": self._raw()["message_id"]}
+                   for _ in payload["message_ids"]]
+        elif api_method == "editMessageText":
+            raw = {"message_id": payload["message_id"], "date": NOW,
+                   "chat": {"id": payload["chat_id"], "type": "private"},
+                   "text": payload["text"]}
         else:
             raw = self._raw()
+        if api_method == "deleteMessage":
+            if self.before_delete:
+                self.before_delete(payload["message_id"])
+            self.visible.pop(payload["message_id"], None)
+        elif api_method == "editMessageText":
+            # Local history clearing is invisible to the server: editing still
+            # succeeds, but cannot recreate a locally hidden message.
+            if payload["message_id"] in self.visible:
+                self.visible[payload["message_id"]] = payload
+        elif api_method == "sendMessage":
+            self.visible[raw["message_id"]] = payload
         content = json.dumps({"ok": True, "result": raw})
         response = self.check_response(bot=bot, method=method, status_code=200,
                                        content=content)
@@ -258,9 +295,13 @@ class _Harness:
         self.session = _FakeApiSession()
         self.bot = Bot("42:TEST", session=self.session)
         self.flow, self.preview = build_flow(services)
+        from poster_bot.ui.dashboard_presentation import DashboardPresentation
+        self.dashboard = DashboardPresentation(self.flow, owner_id=OWNER)
         self.dispatcher = Dispatcher(storage=MemoryStorage())
+        self.now = NOW
         self.dispatcher.include_router(
-            handlers.create_ui_router(self.flow, owner_id=OWNER, clock=lambda: NOW)
+            handlers.create_ui_router(self.flow, owner_id=OWNER, clock=lambda: self.now,
+                                      dashboard=self.dashboard)
         )
         self.ui = UiStateRepo(services.conn)
         self._update_id = 0
@@ -271,23 +312,29 @@ class _Harness:
         asyncio.run(self.dispatcher.feed_update(self.bot, Update.model_validate(update)))
 
     def message(self, **kwargs: Any) -> None:
-        self.feed({"message": _raw_message(**kwargs)})
+        incoming = _raw_message(**kwargs)
+        self.session.visible[incoming["message_id"]] = incoming
+        self.feed({"message": incoming})
 
     def press_text(self, label: str, *, user_id: int = OWNER) -> None:
+        if label in ("Создать пост", "Отложенное", "Черновики", "Контент-план", "Настройки", "Рестарт"):
+            self.message(text=label, message_id=10000 + self._update_id,
+                         **{"from": {"id": user_id, "is_bot": False, "first_name": "x"}})
+            return
         data = self._button_data(label)
         self.feed({"callback_query": {
             "id": f"cb{self._update_id}",
             "from": {"id": user_id, "is_bot": False, "first_name": "x"},
             "chat_instance": "ci",
             "data": data,
-            "message": _raw_message(message_id=2, text="меню"),
+            "message": _raw_message(message_id=self.card_id(), text="меню"),
         }})
 
     def _button_data(self, label: str) -> str:
         for method, payload in reversed(self.session.requests):
-            if method != "sendMessage":
+            if method not in {"sendMessage", "editMessageText"}:
                 continue
-            for row in payload["reply_markup"]["inline_keyboard"]:
+            for row in payload.get("reply_markup", {}).get("inline_keyboard", []):
                 for button in row:
                     if button["text"] == label:
                         return button["callback_data"]
@@ -297,10 +344,17 @@ class _Harness:
         return [p for m, p in self.session.requests if m == "sendMessage"]
 
     def last_text(self) -> str:
-        return self.sent()[-1]["text"]
+        return self.cards()[-1]["text"]
+
+    def cards(self) -> list[dict[str, Any]]:
+        return [p for m, p in self.session.requests
+                if m in {"sendMessage", "editMessageText"}]
+
+    def card_id(self) -> int:
+        return self.flow.navigation_store(OWNER).get(OWNER)
 
     def last_labels(self) -> list[str]:
-        markup = self.sent()[-1].get("reply_markup")
+        markup = self.cards()[-1].get("reply_markup")
         assert markup is not None, "last sent message has no keyboard"
         return [b["text"] for row in markup["inline_keyboard"] for b in row]
 
@@ -320,11 +374,123 @@ def _private_text(text: str) -> dict[str, Any]:
     return {"message": _raw_message(text=text)}
 
 
+@pytest.mark.parametrize("purpose", ["schedule", "edit_time", "replan"])
+@pytest.mark.parametrize("answer_error", [None, "query is too old"])
+@pytest.mark.parametrize("after_ack", [3599, 3600, 3602])
+def test_confirmation_rechecks_clock_after_ack(services, purpose, answer_error, after_ack):
+    from conftest import future, text_content
+
+    h = _Harness(services)
+    post = services.drafts.create(text_content(), now_epoch=NOW)
+    old = None
+    if purpose != "schedule":
+        old = services.publications.schedule(post, future(minutes=120), now_epoch=NOW)
+        if purpose == "replan":
+            services.conn.execute("UPDATE publications SET status='missed' WHERE id=?", (old.id,))
+            services.conn.commit()
+            old = services.publications.get(old.id)
+    h.message(text="/start")
+    h.press_text(texts.MENU_DRAFTS if old is None else texts.MENU_PLAN)
+    if old is None:
+        h.press_text(next(label for label in h.last_labels()
+                          if label.startswith(f"№{post} ·")))
+    else:
+        marker = "❌" if purpose == "replan" else "🕒"
+        h.press_text(next(label for label in h.last_labels()
+                          if label == f"13:00 | {marker} | hello owner"))
+    h.press_text(texts.BTN_SCHEDULE if old is None else
+                 texts.BTN_EDIT_TIME if purpose == "edit_time" else texts.BTN_REPLAN)
+    if old is None:
+        h.press_text(texts.BTN_OWN_TIME)
+    h.message(text="12:00", message_id=40)
+    h.press_text("Продолжить")
+    h.now = NOW + 3599  # 11:59:59, before the selected minute
+    h.session.before_answer = lambda: setattr(h, "now", NOW + after_ack)
+    h.session.answer_error = answer_error
+    before = len(h.session.requests)
+    h.press_text(texts.BTN_CONFIRM)
+    assert sum(m == "answerCallbackQuery" for m, _ in h.session.requests[before:]) == 1
+    if after_ack < 3600:
+        assert texts.SCHEDULED_PREFIX in h.last_text()
+        assert services.publications.get_by_post(post).minute_epoch == NOW + 3600
+        return
+    assert texts.TIME_NOT_FUTURE in h.last_text()
+    assert "12:00" in h.last_text() and "21.10.2026" in h.last_text()
+    assert {"Дата", "Время", "Продолжить"} <= set(h.last_labels())
+    assert services.publications.get_by_post(post) == old
+    assert (NOW + 3600) // 60 not in services.publications.reserved_minutes()
+    assert services.manual_times.recent() == []
+
+
+def test_form_continue_rechecks_clock_after_ack(services):
+    h = _Harness(services)
+    h.message(text="/start")
+    h.press_text(texts.MENU_NEW_POST)
+    h.message(text="post", message_id=40)
+    h.press_text(texts.BTN_CONTINUE)
+    h.press_text(texts.BTN_SCHEDULE)
+    h.press_text(texts.BTN_OWN_TIME)
+    h.message(text="12:00", message_id=41)
+    h.now = NOW + 3599
+    h.session.before_answer = lambda: setattr(h, "now", NOW + 3602)
+    h.press_text("Продолжить")
+    assert texts.TIME_NOT_FUTURE in h.last_text()
+    assert "12:00" in h.last_text()
+    assert texts.BTN_CONFIRM not in h.last_labels()
+    assert services.publications.reserved_minutes() == set()
+
+
+@pytest.mark.parametrize("expired", [True, False])
+def test_hour_selection_rechecks_clock_after_ack(services, expired):
+    h = _Harness(services)
+    h.message(text="/start")
+    h.press_text(texts.MENU_NEW_POST)
+    h.message(text="post", message_id=40)
+    h.press_text(texts.BTN_CONTINUE)
+    h.press_text(texts.BTN_SCHEDULE)
+    h.press_text(texts.BTN_NEXT_SLOT)
+    h.now = NOW + 3599
+    h.session.before_answer = lambda: setattr(h, "now", NOW + (3602 if expired else 3599))
+    h.press_text("12:00")
+    if expired:
+        assert "Этот час уже недоступен" in h.last_text()
+        assert "12:00" not in h.last_labels()
+        assert texts.BTN_CONFIRM not in h.last_labels()
+    else:
+        assert h.last_text().startswith(texts.CONFIRM_SUMMARY_PREFIX)
+        h.press_text(texts.BTN_CONFIRM)
+        assert texts.SCHEDULED_PREFIX in h.last_text()
+
+
 def test_dispatch_start_sends_menu(services: Services) -> None:
     h = _Harness(services)
     h.feed(_private_text("/start"))
-    assert "Создать пост" in h.last_labels()
+    assert h.last_labels() == [texts.MENU_JOURNAL]
+    assert any(button["text"] == texts.MENU_NEW_POST
+               for row in h.sent()[0]["reply_markup"]["keyboard"] for button in row)
     assert h.ui.get().state is State.MENU
+
+
+@pytest.mark.parametrize("label", ["Отложенное", "Черновики"])
+def test_postponed_section_new_and_legacy_keyboard_route(services, label):
+    post_id = services.drafts.create(text_content("stored post"), now_epoch=NOW)
+    h = _Harness(services)
+    h.message(text="/start")
+    keyboard = h.sent()[0]["reply_markup"]["keyboard"]
+    keys = [button["text"] for row in keyboard for button in row]
+    assert len(keys) == 5 and "Отложенное" in keys and "Черновики" not in keys
+    h.message(text=label, message_id=50)
+    assert h.last_text().startswith("Отложенное")
+    assert "Чернов" not in h.last_text()
+    h.press_text(next(value for value in h.last_labels() if value.startswith(f"№{post_id} ·")))
+    assert "Отложенный пост" in h.last_text() and "Чернов" not in h.last_text()
+    assert services.drafts.get_content(post_id).text == "stored post"
+    before = list(h.session.requests)
+    h.message(text=label, message_id=51,
+              **{"from": {"id": 999, "is_bot": False, "first_name": "x"}})
+    h.message(text=label, message_id=52,
+              chat={"id": -100999, "type": "supergroup"})
+    assert h.session.requests == before
 
 
 def test_dispatch_ignores_non_owner_silently(services: Services) -> None:
@@ -356,31 +522,35 @@ def test_dispatch_service_message_silent(services: Services) -> None:
 def test_dispatch_forged_token_stale_reply(services: Services) -> None:
     h = _Harness(services)
     h.feed(_private_text("/start"))
-    before = len(h.sent())
+    before = len(h.session.requests)
+    card = h.cards()[-1]
+    state = h.ui.get()
     h.feed({"callback_query": {
         "id": "cbx",
         "from": {"id": OWNER, "is_bot": False, "first_name": "x"},
         "chat_instance": "ci",
         "data": "a" + "0" * 12,
-        "message": _raw_message(message_id=2, text="меню"),
+        "message": _raw_message(message_id=h.card_id(), text="меню"),
     }})
-    assert h.last_text() == texts.BUTTON_STALE
+    assert [m for m, _ in h.session.requests[before:]] == ["answerCallbackQuery"]
+    assert h.session.requests[-1][1]["text"] == texts.BUTTON_STALE
+    assert h.cards()[-1] == card
     # чужого действия не произошло: состояние всё ещё меню
     assert h.ui.get().state is State.MENU
-    assert len(h.sent()) == before + 1
+    assert h.ui.get() == state
 
 
 def test_dispatch_callback_from_other_user_never_executes(services: Services) -> None:
     h = _Harness(services)
     h.feed(_private_text("/start"))
-    token = h._button_data("Создать пост")
+    token = h._button_data(texts.MENU_JOURNAL)
     before = len(h.sent())
     h.feed({"callback_query": {
         "id": "cbo",
         "from": {"id": 999, "is_bot": False, "first_name": "Чужой"},
         "chat_instance": "ci",
         "data": token,
-        "message": _raw_message(message_id=2, text="меню"),
+        "message": _raw_message(message_id=h.card_id(), text="меню"),
     }})
     # чужое нажатие молча отвергнуто, токен не израсходован
     assert len(h.sent()) == before
@@ -391,9 +561,9 @@ def test_dispatch_callback_from_other_user_never_executes(services: Services) ->
         "from": {"id": OWNER, "is_bot": False, "first_name": "x"},
         "chat_instance": "ci",
         "data": token,
-        "message": _raw_message(message_id=2, text="меню"),
+        "message": _raw_message(message_id=h.card_id(), text="меню"),
     }})
-    assert h.ui.get().state is State.CREATING
+    assert h.ui.get().payload == {"view": "journal"}
 
 
 def test_dispatch_photo_creates_draft_and_preview_only_to_owner(services: Services) -> None:
@@ -446,7 +616,7 @@ def test_dispatch_forward_shows_choice(services: Services) -> None:
                               "chat": {"id": -100555, "type": "channel"},
                               "message_id": 77})
     assert texts.FORWARD_ASK.split("\n")[0] in h.last_text()
-    labels = [b["text"] for row in h.sent()[-1]["reply_markup"]["inline_keyboard"]
+    labels = [b["text"] for row in h.cards()[-1]["reply_markup"]["inline_keyboard"]
               for b in row]
     assert texts.BTN_FORWARD_AS_IS in labels and texts.BTN_MAKE_COPY in labels
     staged = Staged.from_dict(h.ui.get().arg("staged"))

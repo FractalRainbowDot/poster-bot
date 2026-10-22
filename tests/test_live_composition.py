@@ -21,15 +21,18 @@ import pytest
 from aiogram import Bot
 from aiogram.exceptions import (
     TelegramAPIError,
+    TelegramBadRequest,
     TelegramNetworkError,
     TelegramUnauthorizedError,
 )
-from aiogram.methods import GetUpdates
-from conftest import NOW
+from aiogram.methods import GetChat, GetUpdates
+from conftest import NOW, text_content
 from test_ui_handlers_offline import _FakeApiSession
 
 from poster_bot.config import (
+    ENV_CHANNEL,
     ENV_TOKEN,
+    ChannelResolutionError,
     Config,
     ConfigError,
     MalformedTokenError,
@@ -37,6 +40,8 @@ from poster_bot.config import (
 from poster_bot.live import PollFatal, compose_live, run_live
 from poster_bot.polling import POLL_TIMEOUT_SECONDS
 from poster_bot.singleton import ProcessLock
+from poster_bot.transport.ports import Sent
+from poster_bot.ui import texts
 
 OWNER = 111
 CHANNEL = -100222
@@ -108,6 +113,30 @@ def make_bot(session: LiveApiSession) -> Bot:
     return Bot(GOOD_TOKEN, session=session)
 
 
+class ResolvingApiSession(LiveApiSession):
+    """Adds scripted getChat responses for channel-target resolution: canned
+    payloads through aiogram's real validation path, zero sockets."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_payload: Any = None
+        self.chat_error: Exception | None = None
+        self.chat_calls: list[dict] = []
+
+    async def make_request(self, bot, method, timeout=None):
+        if method.__api_method__ == "getChat":
+            self.chat_calls.append({"chat_id": method.chat_id})
+            if self.chat_error is not None:
+                raise self.chat_error
+            assert isinstance(self.chat_payload, dict), "getChat script missing"
+            content = json.dumps({"ok": True, "result": self.chat_payload})
+            response = self.check_response(
+                bot=bot, method=method, status_code=200, content=content
+            )
+            return response.result
+        return await super().make_request(bot, method, timeout)
+
+
 def start_update(update_id: int, *, chat_id: int = OWNER, user_id: int = OWNER):
     return {
         "update_id": update_id,
@@ -133,8 +162,8 @@ class TestTokenGate:
         config = live_config(tmp_path, bot_token=BAD_TOKEN)
         session = LiveApiSession()
         with pytest.raises(MalformedTokenError) as caught:
-            compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                         now_epoch=NOW)
+            asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                         now_epoch=NOW))
         message = str(caught.value)
         assert ENV_TOKEN in message          # names the env var...
         assert BAD_TOKEN not in message      # ...never the token value
@@ -142,8 +171,8 @@ class TestTokenGate:
         assert lock_free(config)             # lock/DB released
         # second attempt: refused for the SAME reason, not by the lock
         with pytest.raises(MalformedTokenError):
-            compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                         now_epoch=NOW)
+            asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                         now_epoch=NOW))
 
     def test_live_gate_blocks_before_token_syntax(self, tmp_path):
         # owner/channel still unset: the durable gate refuses first; the
@@ -151,16 +180,16 @@ class TestTokenGate:
         config = live_config(tmp_path, bot_token=BAD_TOKEN, owner_user_id=0,
                              channel_id=0)
         with pytest.raises(ConfigError) as caught:
-            compose_live(config, clock=lambda: NOW,
-                         bot=make_bot(LiveApiSession()), now_epoch=NOW)
+            asyncio.run(compose_live(config, clock=lambda: NOW,
+                         bot=make_bot(LiveApiSession()), now_epoch=NOW))
         assert not isinstance(caught.value, MalformedTokenError)
         assert any("POSTER_BOT_OWNER_USER_ID" in p for p in caught.value.problems)
 
     def test_empty_token_blocked_by_live_gate(self, tmp_path):
         config = live_config(tmp_path, bot_token="")
         with pytest.raises(ConfigError) as caught:
-            compose_live(config, clock=lambda: NOW,
-                         bot=make_bot(LiveApiSession()), now_epoch=NOW)
+            asyncio.run(compose_live(config, clock=lambda: NOW,
+                         bot=make_bot(LiveApiSession()), now_epoch=NOW))
         assert any(ENV_TOKEN in p for p in caught.value.problems)
         assert "placeholder" in str(caught.value) or "missing" in str(caught.value)
 
@@ -169,8 +198,8 @@ class TestCompositionWiring:
     def test_cycle_polls_durable_offset_and_records_health(self, tmp_path):
         config = live_config(tmp_path)
         session = LiveApiSession()
-        live = compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                            now_epoch=NOW)
+        live = asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                            now_epoch=NOW))
         try:
             assert live.dispatcher.sub_routers[0].name == "owner_ui"
             report = asyncio.run(live.loop.run_cycle())
@@ -194,12 +223,12 @@ class TestCompositionWiring:
         config = live_config(tmp_path)
         session = LiveApiSession()
         session.update_script = [[start_update(501)]]
-        live = compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                            now_epoch=NOW)
+        live = asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                            now_epoch=NOW))
         try:
             report = asyncio.run(live.loop.run_cycle())
             assert report.ok and report.handled == 1
-            assert live.inbox.is_done(501) and live.inbox.safe_offset() == 501
+            assert live.inbox.is_done(501) and live.inbox.safe_offset() == 502
             # the owner got a menu reply — delivered via the composed flow
             assert OWNER in session.sent_chats()
             assert session.sent_to_channel() == []
@@ -210,8 +239,8 @@ class TestCompositionWiring:
         config = live_config(tmp_path)
         session = LiveApiSession()
         session.update_script = [[start_update(601, chat_id=999, user_id=999)]]
-        live = compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                            now_epoch=NOW)
+        live = asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                            now_epoch=NOW))
         try:
             report = asyncio.run(live.loop.run_cycle())
             assert report.handled == 1  # guard drops, but the update is done
@@ -225,8 +254,8 @@ class TestCompositionWiring:
         session = LiveApiSession()
         session.update_script = [TelegramNetworkError(method=GetUpdates(),
                                                       message="secret text")]
-        live = compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                            now_epoch=NOW)
+        live = asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                            now_epoch=NOW))
         try:
             report = asyncio.run(live.loop.run_cycle())
             assert not report.ok and report.failure_code == "transport_error"
@@ -348,8 +377,8 @@ class TestInboundFailureLogHygiene:
             f" (token {GOOD_TOKEN})"
         )
         session.update_script = [[self._owner_text_update(801)]]
-        live = compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                            now_epoch=NOW)
+        live = asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                            now_epoch=NOW))
         try:
             with caplog.at_level(logging.DEBUG):
                 report = asyncio.run(live.loop.run_cycle())
@@ -376,8 +405,8 @@ class TestInboundFailureLogHygiene:
             "update_id": 902,
             "quantum_signal": {"text": f"{self.SENTINEL} via {GOOD_TOKEN}"},
         }]]
-        live = compose_live(config, clock=lambda: NOW, bot=make_bot(session),
-                            now_epoch=NOW)
+        live = asyncio.run(compose_live(config, clock=lambda: NOW, bot=make_bot(session),
+                            now_epoch=NOW))
         try:
             with caplog.at_level(logging.DEBUG), \
                     warnings.catch_warnings(record=True) as caught:
@@ -401,8 +430,185 @@ class TestInboundFailureLogHygiene:
         config = live_config(tmp_path, bot_token=BAD_TOKEN)
         with caplog.at_level(logging.DEBUG):
             with pytest.raises(MalformedTokenError) as caught:
-                compose_live(config, clock=lambda: NOW,
-                             bot=make_bot(LiveApiSession()), now_epoch=NOW)
+                asyncio.run(compose_live(config, clock=lambda: NOW,
+                             bot=make_bot(LiveApiSession()), now_epoch=NOW))
         assert caught.value.__cause__ is None  # aiogram error fully suppressed
         assert BAD_TOKEN not in str(caught.value)
         assert BAD_TOKEN not in caplog.text
+
+
+USERNAME = "@test_chan_public2"
+RESOLVED = -1009876543  # stable numeric id the fake returns for USERNAME
+
+
+def channel_payload(**over) -> dict:
+    # getChat returns ChatFullInfo (aiogram 3.31): the full-info fields are
+    # required by the response model — canned payload only, no real data
+    raw = {
+        "id": RESOLVED,
+        "type": "channel",
+        "username": "test_chan_public2",
+        "title": "Test Channel",
+        "accent_color_id": 1,
+        "max_reaction_count": 10,
+        "accepted_gift_types": {
+            "unlimited_gifts": 0, "limited_gifts": 0, "unique_gifts": 0,
+            "premium_subscription": 0, "gifts_from_channels": 0,
+        },
+    }
+    raw.update(over)
+    return raw
+
+
+class TestChannelTargetResolution:
+    """Live startup resolves a configured @username via getChat BEFORE any
+    transport/flow exists; every send targets the returned numeric id; a
+    refused resolution releases lock/DB/session with zero send attempts."""
+
+    def _live(self, config, session):
+        return asyncio.run(compose_live(config, clock=lambda: NOW,
+                                        bot=make_bot(session), now_epoch=NOW))
+
+    def test_numeric_target_performs_no_get_chat(self, tmp_path):
+        # getChat script intentionally missing: any resolution attempt for a
+        # numeric target would hard-fail this composition
+        config = live_config(tmp_path)  # channel_id = -100222 (numeric)
+        session = ResolvingApiSession()
+        live = self._live(config, session)
+        try:
+            assert session.chat_calls == []
+            assert "getChat" not in [name for name, _ in session.requests]
+        finally:
+            asyncio.run(live.close())
+
+    def test_username_resolves_to_numeric_destination_used_by_sends(self, tmp_path):
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_payload = channel_payload()
+        live = self._live(config, session)
+        try:
+            assert session.chat_calls == [{"chat_id": USERNAME}]
+            outcome = asyncio.run(live.transport.publish(text_content("hello")))
+            assert isinstance(outcome, Sent)
+            sends = [p for name, p in session.requests if name == "sendMessage"]
+            assert sends and sends[-1]["chat_id"] == RESOLVED  # numeric, not @name
+            assert outcome.permalink == (
+                f"https://t.me/test_chan_public2/{outcome.message_ids[0]}"
+            )
+        finally:
+            asyncio.run(live.close())
+
+    def test_owner_ui_paths_stay_private_under_resolved_username(self, tmp_path):
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_payload = channel_payload()
+        session.update_script = [[start_update(511)]]
+        live = self._live(config, session)
+        try:
+            report = asyncio.run(live.loop.run_cycle())
+            assert report.ok and report.handled == 1
+            # Telegram needs separate messages for the persistent input menu
+            # and inline service card. Both must remain private after resolution.
+            assert session.sent_chats() == [OWNER, OWNER]
+            sends = [p for name, p in session.requests if name == "sendMessage"]
+            keyboard_messages = [p for p in sends
+                                 if "keyboard" in p.get("reply_markup", {})]
+            card_messages = [p for p in sends
+                             if "inline_keyboard" in p.get("reply_markup", {})]
+            assert len(keyboard_messages) == len(card_messages) == 1
+            keyboard = keyboard_messages[0]["reply_markup"]
+            assert keyboard["resize_keyboard"] is True
+            assert keyboard["is_persistent"] is True
+            assert [[b["text"] for b in row] for row in keyboard["keyboard"]] == [
+                [texts.MENU_NEW_POST, texts.MENU_DRAFTS],
+                [texts.MENU_PLAN, texts.MENU_SETTINGS],
+                [texts.MENU_RESTART],
+            ]
+            card = card_messages[0]
+            assert card["text"] == "📅 Контент-план\nНет запланированных публикаций."
+            assert "Нет запланированных публикаций" in card["text"]
+            buttons = [b for row in card["reply_markup"]["inline_keyboard"]
+                       for b in row]
+            assert [b["text"] for b in buttons] == [texts.MENU_JOURNAL]
+            assert all(b.get("callback_data") and not b.get("url") for b in buttons)
+            # Check all chat-addressed operations, not just text sends: neither
+            # the numeric channel nor its username may receive UI output.
+            assert all(p["chat_id"] == OWNER for _, p in session.requests
+                       if "chat_id" in p)
+        finally:
+            asyncio.run(live.close())
+
+    def test_group_destination_refused_before_any_send(self, tmp_path):
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_payload = channel_payload(
+            id=-100444, type="group", username=None)
+        with pytest.raises(ChannelResolutionError) as caught:
+            self._live(config, session)
+        message = str(caught.value)
+        assert ENV_CHANNEL in message and "not a channel" in message
+        assert USERNAME not in message  # values are never echoed
+        assert not [n for n, _ in session.requests
+                    if n in {"sendMessage", "sendPhoto", "sendVideo",
+                             "sendMediaGroup", "forwardMessages"}]
+        assert session.closed and lock_free(config)
+
+    def test_channel_type_with_positive_id_refused(self, tmp_path):
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_payload = channel_payload(id=555)
+        with pytest.raises(ChannelResolutionError):
+            self._live(config, session)
+        assert session.closed and lock_free(config)
+
+    def test_get_chat_api_failure_maps_to_safe_code_no_leak(self, tmp_path):
+        leak = "400: chat not found mentioning PRIVATE-TEXT-9f31"
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_error = TelegramBadRequest(
+            method=GetChat(chat_id=USERNAME), message=leak)
+        with pytest.raises(ChannelResolutionError) as caught:
+            self._live(config, session)
+        message = str(caught.value)
+        assert "not accessible" in message
+        assert leak not in message and USERNAME not in message
+        assert not [n for n, _ in session.requests if n == "sendMessage"]
+        assert session.closed and lock_free(config)
+
+    def test_network_failure_maps_to_unreachable(self, tmp_path):
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_error = TelegramNetworkError(
+            method=GetChat(chat_id=USERNAME), message="connection reset")
+        with pytest.raises(ChannelResolutionError) as caught:
+            self._live(config, session)
+        assert "Telegram not reachable" in str(caught.value)
+        assert session.closed and lock_free(config)
+
+    def test_malformed_token_still_refused_before_resolution(self, tmp_path):
+        # startup order intact: token syntax precedes any getChat
+        config = live_config(tmp_path, bot_token=BAD_TOKEN, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        with pytest.raises(MalformedTokenError):
+            self._live(config, session)
+        assert session.chat_calls == []
+        assert lock_free(config)
+
+    def test_run_live_resolves_username_then_polls_and_cleans_up(self, tmp_path):
+        config = live_config(tmp_path, channel_id=USERNAME)
+        session = ResolvingApiSession()
+        session.chat_payload = channel_payload()
+        stop = asyncio.Event()
+
+        def stop_after_one_poll():
+            if len(session.poll_calls) >= 1:
+                stop.set()
+
+        session.on_poll = stop_after_one_poll
+        asyncio.run(run_live(config, clock=lambda: NOW, bot=make_bot(session),
+                             stop_event=stop, install_signals=False,
+                             now_epoch=NOW))
+        assert session.chat_calls == [{"chat_id": USERNAME}]
+        assert len(session.poll_calls) == 1
+        assert not [n for n, _ in session.requests if n == "sendMessage"]
+        assert session.closed and lock_free(config)

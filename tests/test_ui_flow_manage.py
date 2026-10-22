@@ -31,13 +31,16 @@ def _scheduled(flow, services, *, post_id: int | None = None):
     created = _draft_created(flow)
     picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
     confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=NOW)
+    confirm = press_label(flow, confirm, '12:00', now=NOW)
     press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
     return services.publications.get_by_post(_number(created.text))
 
 
 def _open_pub(flow, pub_id: int, *, now: int = NOW):
     day = flow.plan_today(now=now)
-    return press_label(flow, day, f"№{pub_id}", now=now)
+    view = press_label(flow, day, day.rows[0][0].label, now=now)
+    assert f"Публикация №{pub_id}." in view.text
+    return view
 
 
 class TestPauseResume:
@@ -85,6 +88,7 @@ class TestEdits:
         view = _open_pub(flow, pub.id)
         press_label(flow, view, texts.BTN_EDIT_TIME, now=NOW)
         confirm = run(flow.text(now=NOW, text="25.10.2026 10:00"))
+        confirm = press_label(flow, confirm, 'Продолжить', now=NOW)
         assert confirm.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
         done = press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
         assert texts.TIME_EDITED in done.text
@@ -100,12 +104,17 @@ class TestCancelAndDelete:
         flow, _ = build_flow(services)
         pub = _scheduled(flow, services)
         view = _open_pub(flow, pub.id)
+        original = services.drafts.get_content(pub.post_id)
+        assert texts.BTN_TO_DRAFTS == "В отложенное"
         ask = press_label(flow, view, texts.BTN_TO_DRAFTS, now=NOW)
         assert ask.text.startswith(texts.PUB_CANCEL_ASK)
+        assert "без даты публикации" in ask.text
         done = press_label(flow, ask, texts.BTN_YES, now=NOW)
         assert done.text.startswith(texts.TO_DRAFTS_DONE)
         assert services.publications.get_by_post(pub.post_id) is None
         assert services.drafts.is_draft(pub.post_id)
+        assert services.drafts.get_content(pub.post_id) == original
+        assert "отложенном без даты публикации" in done.text
         # the minute is genuinely free again
         rival = services.drafts.create(text_content(), now_epoch=NOW)
         moved = services.publications.schedule(
@@ -162,10 +171,11 @@ class TestPublished:
         assert link.url == "https://t.me/c/555/55"
         assert texts.BTN_PAUSE not in labels(view)
         assert texts.BTN_EDIT_TIME not in labels(view)
-        # day-plan row carries the same history link
+        # The full-width day row opens the read-only detail containing the link.
         day = flow.plan_today(now=NOW)
-        link_buttons = [b for r in day.rows for b in r if b.url]
-        assert link_buttons and link_buttons[0].url == "https://t.me/c/555/55"
+        assert len(day.rows[0]) == 1 and " | ✅ | " in day.rows[0][0].label
+        detail = press_label(flow, day, day.rows[0][0].label, now=NOW)
+        assert any(b.url == "https://t.me/c/555/55" for r in detail.rows for b in r)
 
 
 class TestUncertain:

@@ -65,9 +65,13 @@ def _schedule(flow, created, *, now: int = NOW, own_time: str | None = None):
     picker = press_label(flow, created, texts.BTN_SCHEDULE, now=now)
     if own_time is None:
         confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=now)
+        hour = next(button.label for row in confirm.rows for button in row
+                    if re.fullmatch(r'\d{2}:00', button.label))
+        confirm = press_label(flow, confirm, hour, now=now)
     else:
         press_label(flow, picker, texts.BTN_OWN_TIME, now=now)
         confirm = run(flow.text(now=now, text=own_time))
+        confirm = press_label(flow, confirm, 'Продолжить', now=now)
         assert confirm.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
     scheduled = press_label(flow, confirm, texts.BTN_CONFIRM, now=now)
     assert scheduled.text.startswith(texts.SCHEDULED_PREFIX)
@@ -98,6 +102,9 @@ def _journey(services, stage, *, finish=texts.BTN_CONTINUE, own_time=None):
     assert pub.status is Status.SCHEDULED
     # unique future minute: strictly future and minute-aligned
     assert pub.minute_epoch > NOW and pub.minute_epoch % 60 == 0
+
+    early = run(rt.tick(now_epoch=NOW))
+    assert early.sent == () and channel.calls == []
 
     report = run(rt.tick(now_epoch=pub.scheduled_epoch))
     assert [r.outcome for r in report.sent] == ["published"]
@@ -203,13 +210,19 @@ class TestAlbumAndForwardCarryCaptions:
 
         flow, preview = build_flow(services)
         run(flow.new_post(now=NOW))
-        candidate = Staged()
-        candidate.add_media("photo", "p1", "cap1", (Entity("italic", 0, 4),),
-                            "g1")
-        candidate.add_media("video", "v1", "cap2", (), "g1")
+        first = Staged()
+        first.add_media("photo", "p1", "cap1", (Entity("italic", 0, 4),),
+                        "g1")
+        run(flow.forwarded(now=NOW, src_chat_id=-100999,
+                           src_message_id=42, media_group_id="g1",
+                           copy_candidate=first))
+        # Each forwarded album message contributes its own single-item
+        # candidate and distinct source ID, just as real intake does.
+        second = Staged()
+        second.add_media("video", "v1", "cap2", (), "g1")
         ask = run(flow.forwarded(now=NOW, src_chat_id=-100999,
-                                 src_message_id=42, media_group_id="g1",
-                                 copy_candidate=candidate))
+                                 src_message_id=43, media_group_id="g1",
+                                 copy_candidate=second))
         copied = press_label(flow, ask, texts.BTN_MAKE_COPY, now=NOW)
         created = press_label(flow, copied, texts.BTN_CONTINUE, now=NOW)
         content = services.drafts.get_content(_post_id(created.text))
@@ -252,7 +265,7 @@ class TestEditPauseNoSend:
         _schedule(flow, created)
         pub = services.publications.get_by_post(_post_id(created.text))
         day = flow.plan_today(now=NOW)
-        view = press_label(flow, day, f"№{pub.id}", now=NOW)
+        view = press_label(flow, day, " | 🕒 | до правки", now=NOW)
         press_label(flow, view, texts.BTN_EDIT_CONTENT, now=NOW)
         staged2 = run(flow.text(now=NOW, text="после правки"))
         done = press_label(flow, staged2, texts.BTN_CONTINUE, now=NOW)
@@ -322,8 +335,8 @@ class TestJournalPruningThroughLiveLoop:
 
         clock = _Clock()
         session = LiveApiSession()
-        live = compose_live(live_config(tmp_path), clock=clock,
-                            bot=make_bot(session), now_epoch=NOW)
+        live = run(compose_live(live_config(tmp_path), clock=clock,
+                                bot=make_bot(session), now_epoch=NOW))
         try:
             live.app.journal.record(
                 "draft_created", now_epoch=NOW - (RETENTION_DAYS + 1) * DAY)

@@ -57,7 +57,7 @@ class TestDurableOrdering:
         assert observations == [(False, True), (False, True)]
         assert h.inbox.is_done(11) and h.inbox.is_done(12)
         assert h.inbox.pending_ids() == []
-        assert h.inbox.safe_offset() == 12
+        assert h.inbox.safe_offset() == 13
 
     def test_done_updates_are_skipped(self, tmp_path):
         h = build_harness(tmp_path)
@@ -83,10 +83,10 @@ class TestDurableOrdering:
         # the crashed row stays pending (never done), the healthy one is done
         assert h.inbox.pending_ids() == [21]
         assert h.inbox.is_done(22)
-        # offset pinned BELOW the pending id so Telegram re-delivers it
+        # Inclusive offset pins AT the pending id so Telegram re-delivers it.
         h.source.script = [[update(21)]]
         report2 = run(h.loop.run_cycle())
-        assert h.source.offsets[-1] == 20  # min pending - 1
+        assert h.source.offsets[-1] == 21  # min pending
         assert report2.handled == 1
         assert h.inbox.pending_ids() == []
         assert h.handler.seen.count(21) == 2  # REDO reprocessed
@@ -97,8 +97,8 @@ class TestDurableOrdering:
         run(h.loop.run_cycle())
         h.source.script = [[update(11), update(12)]]
         run(h.loop.run_cycle())
-        assert h.source.offsets == [None, 10]  # durable offset progression
-        assert h.inbox.safe_offset() == 12
+        assert h.source.offsets == [None, 11]  # durable offset progression
+        assert h.inbox.safe_offset() == 13
 
 
 class TestPollFailures:
@@ -113,8 +113,8 @@ class TestPollFailures:
         assert h.transport.calls == []  # no channel sends on poll failure
         assert h.app.runtime.last_poll() is None  # health NOT recorded
         assert report.sleep_seconds == 1.0
-        # backoff doubles per consecutive failure, capped at 30
-        for expected in (2.0, 4.0, 8.0):
+        # Network polling backoff doubles, capped at 4 seconds.
+        for expected in (2.0, 4.0, 4.0):
             h.source.script = [PollFailure("transport_error")]
             assert run(h.loop.run_cycle()).sleep_seconds == expected
         # a fresh successful poll sends nothing new until health returns,
@@ -127,7 +127,7 @@ class TestPollFailures:
 
     def test_backoff_cap_and_reset_after_success(self, tmp_path):
         h = build_harness(tmp_path)
-        for expected in (1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0):
+        for expected in (1.0, 2.0, 4.0, 4.0, 4.0, 4.0, 4.0):
             h.source.script = [PollFailure("timeout")]
             assert run(h.loop.run_cycle()).sleep_seconds == expected
         report = run(h.loop.run_cycle())  # success
@@ -255,6 +255,7 @@ class TestIdempotentRedoWithRealFlow:
         created = run(_press(flow, staged, texts.BTN_CONTINUE))
         picker = run(_press(flow, created, texts.BTN_SCHEDULE))
         confirm = run(_press(flow, picker, texts.BTN_NEXT_SLOT))
+        confirm = run(_press(flow, confirm, "12:00"))
         token = find_token(confirm, texts.BTN_CONFIRM)
         post_id = int(re.search(r"№(\d+)", created.text).group(1))
 

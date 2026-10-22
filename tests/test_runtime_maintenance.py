@@ -177,13 +177,13 @@ class TestInboxCompactionInTick:
         rt.inbox.complete(10, now_epoch=NOW)
         rt.inbox.complete(11, now_epoch=NOW)
         floor_before = rt.inbox.safe_offset()
-        assert floor_before == 11  # min pending 12 - 1
+        assert floor_before == 12  # inclusive min pending
 
         report = run(rt.rt.tick(now_epoch=NOW))
-        assert report.inbox_compacted == 1  # done id 10 strictly below floor
+        assert report.inbox_compacted == 2  # DONE ids 10, 11 below floor
         assert rt.inbox.pending_ids() == [12]  # backlog untouched
         assert rt.inbox.safe_offset() == floor_before  # floor never regresses
-        assert rt.inbox.is_done(11)  # done row AT the floor is kept
+        assert not rt.inbox.is_done(11)  # confirmed DONE receipt compacted
         assert not rt.inbox.is_done(12)  # pending stays pending
 
     def test_all_done_keeps_anchor_and_offset(self, services):
@@ -192,7 +192,7 @@ class TestInboxCompactionInTick:
             rt.inbox.begin(uid, now_epoch=NOW)
             rt.inbox.complete(uid, now_epoch=NOW)
         floor_before = rt.inbox.safe_offset()
-        assert floor_before == 6  # highest receipt
+        assert floor_before == 7  # highest receipt + 1
 
         report = run(rt.rt.tick(now_epoch=NOW))
         assert report.inbox_compacted == 1  # done id 5 dropped, anchor 6 kept

@@ -26,6 +26,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     MessageEntity,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 
 from ..domain.content import ContentValidationError, Entity
@@ -33,6 +35,9 @@ from .flow import OwnerFlow
 from .guards import is_owner_private
 from .replies import TEXT_MAX, Reply
 from .staged import Staged, copy_candidate_from_media, copy_candidate_from_text
+from . import texts
+from .presentation import present, delete_best_effort
+from .dashboard_presentation import DashboardPresentation
 
 #: clock injectable so offline composition/tests can pin time
 Clock = Callable[[], int]
@@ -184,37 +189,80 @@ def _chunks(text: str) -> list[str]:
     return parts
 
 
-async def _deliver(bot: Bot, chat_id: int, reply: Reply) -> None:
-    parts = _chunks(reply.text)
-    for index, part in enumerate(parts):
-        markup = _keyboard(reply) if index == len(parts) - 1 else None
-        await bot.send_message(chat_id=chat_id, text=part, reply_markup=markup)
-
-
 def create_ui_router(
-    flow: OwnerFlow, *, owner_id: int, clock: Clock | None = None
+    flow: OwnerFlow, *, owner_id: int, clock: Clock | None = None,
+    dashboard: DashboardPresentation | None = None,
 ) -> Router:
     """Router for the private owner chat. Include it on the bot ONLY in live
     composition; ``flow`` must be composed on the same connection/services."""
 
     now_fn: Clock = clock if clock is not None else (lambda: int(time.time()))
     router = Router(name="owner_ui")
+    navigation = flow.navigation_store(owner_id)
+    dashboard = dashboard or DashboardPresentation(flow, owner_id=owner_id)
+    presentation_lock = dashboard.lock
+
+    async def serialized(handler, event, data):
+        # Keep the committed flow transition and its service-card rendering in
+        # order, including when a Dispatcher processes updates concurrently.
+        async with presentation_lock:
+            return await handler(event, data)
+
+    router.message.outer_middleware(serialized)
+    router.callback_query.outer_middleware(serialized)
+    menu_labels = (texts.MENU_NEW_POST, texts.MENU_DRAFTS,
+                   texts.MENU_PLAN, texts.MENU_SETTINGS)
+
+    async def deliver(bot: Bot, chat_id: int, reply: Reply) -> None:
+        parts = _chunks(reply.text)
+        for part in parts[:-1]:
+            await bot.send_message(chat_id=chat_id, text=part)
+        await present(bot, chat_id, parts[-1], _keyboard(reply), navigation,
+                      now=now_fn())
+        dashboard.presented(reply)
 
     def allowed(message: Message) -> bool:
         return message_allowed(message, owner_id=owner_id)
 
+    @router.message(lambda message: message.text == texts.MENU_RESTART
+                    and message.forward_origin is None)
     @router.message(CommandStart())
     async def on_start(message: Message) -> None:
         if not allowed(message):
             return
         reply = await flow.command_start(now=now_fn())
-        await _deliver(message.bot, message.chat.id, reply)
+        # Telegram cannot combine reply and inline keyboards on one message.
+        # Reinstall on every /start or Рестарт: local history clearing is invisible to us.
+        # Only our durably tracked prompt is eligible for replacement cleanup.
+        old_prompt = navigation.keyboard_message(message.chat.id)
+        prompt = await message.bot.send_message(
+            chat_id=message.chat.id, text="Меню доступно под полем ввода.",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text=label) for label in menu_labels[:2]],
+                          [KeyboardButton(text=label) for label in menu_labels[2:]],
+                          [KeyboardButton(text=texts.MENU_RESTART)]],
+                resize_keyboard=True, is_persistent=True))
+        try:
+            navigation.record_keyboard(message.chat.id, prompt.message_id, now=now_fn())
+        except Exception:
+            await delete_best_effort(message.bot, message.chat.id, prompt.message_id)
+            raise
+        if old_prompt is not None:
+            await delete_best_effort(message.bot, message.chat.id, old_prompt)
+        await deliver(message.bot, message.chat.id, reply)
+        await delete_best_effort(message.bot, message.chat.id, message.message_id)
 
     @router.message()
     async def on_message(message: Message) -> None:
         if not allowed(message):
             return  # unauthorized traffic gets no reply at all
         now = now_fn()
+        if (message.text in (*menu_labels, texts.LEGACY_MENU_DRAFTS)
+                and message.forward_origin is None):
+            reply = await flow.menu_navigation(label=message.text, now=now)
+            await deliver(message.bot, message.chat.id, reply)
+            await delete_best_effort(message.bot, message.chat.id, message.message_id)
+            return
         # durable per-message effect key: a redelivered update (crash between
         # the flow's committed effect and inbox.complete) replays idempotently
         # inside the flow instead of duplicating intake effects
@@ -227,7 +275,7 @@ def create_ui_router(
                 copy_candidate = _copy_candidate(message)
             except ContentValidationError as exc:
                 reply = flow.content_rejected(now=now, exc=exc)
-                await _deliver(message.bot, message.chat.id, reply)
+                await deliver(message.bot, message.chat.id, reply)
                 return
             reply = await flow.forwarded(
                 now=now,
@@ -237,7 +285,7 @@ def create_ui_router(
                 copy_candidate=copy_candidate,
                 source_key=source_key,
             )
-            await _deliver(message.bot, message.chat.id, reply)
+            await deliver(message.bot, message.chat.id, reply)
             return
         if message.text is not None:
             reply = await flow.text(
@@ -246,7 +294,9 @@ def create_ui_router(
                 entities=to_domain_entities(message.entities),
                 source_key=source_key,
             )
-            await _deliver(message.bot, message.chat.id, reply)
+            await deliver(message.bot, message.chat.id, reply)
+            if flow.input_captured(source_key):
+                await delete_best_effort(message.bot, message.chat.id, message.message_id)
             return
         media = None
         if message.photo:
@@ -265,10 +315,12 @@ def create_ui_router(
                 media_group_id=message.media_group_id,
                 source_key=source_key,
             )
-            await _deliver(message.bot, message.chat.id, reply)
+            await deliver(message.bot, message.chat.id, reply)
+            if flow.input_captured(source_key):
+                await delete_best_effort(message.bot, message.chat.id, message.message_id)
             return
         reply = flow.unsupported(now=now)
-        await _deliver(message.bot, message.chat.id, reply)
+        await deliver(message.bot, message.chat.id, reply)
 
     @router.callback_query()
     async def on_callback(query: CallbackQuery) -> None:
@@ -276,11 +328,35 @@ def create_ui_router(
         if not callback_allowed(query, owner_id=owner_id) or message is None:
             # forged callbacks: executed nowhere, acknowledged nowhere
             return
-        reply = await flow.press(now=now_fn(), token=query.data or "")
-        try:
-            await query.answer()
-        except Exception:
-            pass  # an expired query toast must not swallow the state update
-        await _deliver(query.bot, message.chat.id, reply)
+        # Unknown/superseded cards cannot consume tokens or target previews.
+        if navigation.get(message.chat.id) != message.message_id:
+            try:
+                await query.answer(texts.BUTTON_STALE)
+            except Exception:
+                pass
+            return
+        answered = False
+
+        async def acknowledge() -> None:
+            nonlocal answered
+            answered = True
+            try:
+                await query.answer()
+            except Exception:
+                pass  # an expired query must not swallow the state update
+
+        reply = await flow.press(now=now_fn(), token=query.data or "",
+                                 on_consumed=acknowledge, refresh_now=now_fn)
+        if not answered:
+            try:
+                await query.answer(reply.text if reply.stale_callback else None)
+            except Exception:
+                pass
+        if reply.stale_callback:
+            return  # even a failed toast must leave the active card untouched
+        await deliver(query.bot, message.chat.id, reply)
+        for chat_id, message_id in reply.released_inputs:
+            if chat_id == owner_id and flow.input_captured(f"{chat_id}:{message_id}"):
+                await delete_best_effort(query.bot, chat_id, message_id)
 
     return router

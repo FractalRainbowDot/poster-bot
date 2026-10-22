@@ -7,13 +7,17 @@ decision is testable offline without aiogram types.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from .dashboard import Dashboard
 
 #: Telegram hard limit for message texts
 TEXT_MAX = 4096
-#: conservative keyboard shape (well inside client acceptance limits)
-MAX_ROWS = 8
-#: draft/plan list entries per page
+#: Application guard, not a Telegram hard limit: twelve single-column planned
+#: entries plus Journal. Paginated draft/day lists keep their smaller page size.
+MAX_ROWS = 13
+#: draft/journal list entries per page
 PAGE_SIZE = 6
+#: content-plan publications per day page (independent of the main dashboard).
+DAY_PAGE_SIZE = 10
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,17 @@ class Reply:
 
     text: str
     rows: tuple[tuple[Button, ...], ...] = field(default_factory=tuple)
+    # A rejected callback is a toast, never a replacement for the active card.
+    stale_callback: bool = False
+    # Successful non-content input; flow records a durable per-message receipt
+    # before the adapter may remove the owner's incoming message.
+    input_accepted: bool = False
+    # Server-owned received sources released by an explicit persisted copy.
+    # Adapter additionally checks owner chat and durable intake receipt.
+    released_inputs: tuple[tuple[int, int], ...] = ()
+    # Main-card identity metadata; never used to change business state.
+    dashboard: Dashboard | None = None
+    dashboard_version: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.text) > TEXT_MAX:

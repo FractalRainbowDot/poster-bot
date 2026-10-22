@@ -32,6 +32,35 @@ def env_file(tmp_path):
 
 
 class TestCheck:
+    def test_check_accepts_username_channel_offline(self, tmp_path):
+        """@username-канал проходит офлайн-проверку без Telegram-сети (Phase B)."""
+        path = tmp_path / "env-username"
+        path.write_text(
+            f"POSTER_BOT_BOT_TOKEN={SECRET}\n"
+            f"POSTER_BOT_DB_PATH={tmp_path / 'u.sqlite3'}\n"
+            f"POSTER_BOT_CHANNEL_ID=@test_chan_public2\n"
+            f"POSTER_BOT_OWNER_USER_ID=777\n"
+        )
+        result = _run("check", env_file=path)
+        assert result.returncode == 0, result.stderr
+        # проверка офлайн: канал НЕ резолвится сетью — только формат
+        assert "config is fit for live mode" in result.stdout
+        assert SECRET not in result.stdout + result.stderr
+
+    def test_check_rejects_malformed_username_names_only(self, tmp_path):
+        for bad in ("@ab", "@1badname", "not-an-id"):
+            path = tmp_path / f"env-bad-{bad}"
+            path.write_text(
+                f"POSTER_BOT_BOT_TOKEN={SECRET}\n"
+                f"POSTER_BOT_DB_PATH={tmp_path / 'b.sqlite3'}\n"
+                f"POSTER_BOT_CHANNEL_ID={bad}\n"
+            )
+            result = _run("check", env_file=path)
+            assert result.returncode == 2, (bad, result.stdout, result.stderr)
+            assert "POSTER_BOT_CHANNEL_ID" in result.stderr
+            assert bad not in result.stderr
+            assert SECRET not in result.stdout + result.stderr
+
     def test_check_creates_db_and_passes_with_dummies(self, env_file, tmp_path):
         result = _run("check", env_file=env_file)
         assert result.returncode == 0, result.stderr

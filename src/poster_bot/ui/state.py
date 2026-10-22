@@ -148,5 +148,17 @@ class UiStateRepo:
         ).fetchone()
         return row is not None
 
+    def record_effect(self, effect_key: str, *, now_epoch: int) -> None:
+        """Receipt for a completed non-content input; preserve issued versions.
+
+        Content intake uses set(effect_key=...) to commit content and receipt
+        together. This method must only follow a successful durable operation.
+        """
+        with immediate_tx(self._conn) as conn:
+            conn.execute(
+                "INSERT INTO ui_effects(effect_key, applied_at) VALUES (?, ?) "
+                "ON CONFLICT(effect_key) DO NOTHING", (effect_key, iso(now_epoch)),
+            )
+
     def reset_to_menu(self, *, now_epoch: int | None = None) -> UiState:
         return self.set(State.MENU, {}, now_epoch=now_epoch)

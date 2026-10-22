@@ -219,10 +219,14 @@ class TestAlbum:
         run(flow.new_post(now=NOW))
         candidate = Staged()
         candidate.add_media("photo", "p1", "cap1", (), "g1")
-        candidate.add_media("video", "v1", "cap2", (), "g1")
         ask = run(flow.forwarded(now=NOW, src_chat_id=-100999,
                                  src_message_id=42, media_group_id="g1",
                                  copy_candidate=candidate))
+        second = Staged()
+        second.add_media("video", "v1", "cap2", (), "g1")
+        ask = run(flow.forwarded(now=NOW, src_chat_id=-100999,
+                                 src_message_id=43, media_group_id="g1",
+                                 copy_candidate=second))
         assert ask.text == texts.FORWARD_ASK
         copied = press_label(flow, ask, texts.BTN_MAKE_COPY, now=NOW)
         created = press_label(flow, copied, texts.BTN_CONTINUE, now=NOW)

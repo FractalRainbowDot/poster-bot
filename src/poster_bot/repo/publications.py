@@ -98,6 +98,14 @@ class PublicationsService:
         ).fetchall()
         return frozenset(row["minute_epoch"] for row in rows)
 
+    def nearest_planned(self, *, limit: int = 12) -> list[Publication]:
+        """Unsent plan only; epochs order independently of the display zone."""
+        rows = self._conn.execute(
+            "SELECT * FROM publications WHERE status IN ('scheduled','suspended')"
+            " ORDER BY scheduled_epoch, id LIMIT ?", (limit,),
+        ).fetchall()
+        return [row_to_publication(row) for row in rows]
+
     def scheduled_between(self, start_epoch: int,
                           end_epoch: int) -> list[Publication]:
         """All publications scheduled in [start, end) — day plan view,

@@ -59,6 +59,9 @@ ALLOWED_UPDATES = ("message", "callback_query")
 
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 30.0
+# Read-only polling must remain responsive after connectivity returns.
+# 1, 2, 4 seconds bounds extra interactive latency without a tight retry loop.
+TRANSIENT_BACKOFF_MAX_SECONDS = 4.0
 
 #: ambiguous channel outcomes that mean "connectivity is not to be trusted"
 _UNSAFE_SEND_CODES = frozenset({"timeout", "transport_error"})
@@ -66,11 +69,20 @@ _UNSAFE_SEND_CODES = frozenset({"timeout", "transport_error"})
 
 class PollFailure(Exception):
     """Retryable getUpdates problem (timeout, network, transient API error).
-    Carries an allowlisted safe code only — never Telegram's message text."""
+    Carries safe classifications/numeric timing only, never API message text.
+    ``retry_after`` is Telegram's minimum wait on read-only getUpdates (429)."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, failure_class: str = "PollFailure",
+        category: str = "unknown", request_duration_ms: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
+        self.failure_class = failure_class
+        self.category = category
+        self.request_duration_ms = request_duration_ms
+        self.retry_after = retry_after
 
 
 class PollFatal(Exception):
@@ -91,7 +103,7 @@ class UpdateLike(Protocol):
 
 
 class UpdateSource(Protocol):
-    """Long-poll port. Must return every update with id > ``offset`` and
+    """Long-poll port. Must return every update with id >= ``offset`` and
     raise only ``PollFailure``/``PollFatal`` for transport problems."""
 
     async def fetch(
@@ -116,6 +128,8 @@ class CycleReport:
     ok: bool
     failure_code: str | None = None
     failure_class: str | None = None
+    failure_category: str | None = None
+    request_duration_ms: int | None = None
     fetched: int = 0
     handled: int = 0
     skipped_done: int = 0
@@ -133,10 +147,10 @@ class CycleReport:
     sleep_seconds: float = 0.0
 
 
-def _backoff_seconds(consecutive_failures: int) -> float:
+def _backoff_seconds(consecutive_failures: int, *, transient: bool = False) -> float:
     return min(
-        BACKOFF_BASE_SECONDS * (2 ** (consecutive_failures - 1)),
-        BACKOFF_MAX_SECONDS,
+        BACKOFF_BASE_SECONDS * (2 ** min(consecutive_failures - 1, 5)),
+        TRANSIENT_BACKOFF_MAX_SECONDS if transient else BACKOFF_MAX_SECONDS,
     )
 
 
@@ -192,11 +206,12 @@ class PollLoop:
             raise
         except PollFailure as exc:
             self._consecutive_failures += 1
-            logger.warning("poll failed: code=%s", exc.code)
-            return self._failure_report(exc.code, type(exc).__name__)
+            return self._failure_report(
+                exc.code, exc.failure_class, category=exc.category,
+                duration_ms=exc.request_duration_ms, retry_after=exc.retry_after,
+            )
         except Exception as exc:  # adapter violated its contract
             self._consecutive_failures += 1
-            logger.warning("poll failed: %s", type(exc).__name__)
             return self._failure_report("unclassified", type(exc).__name__)
 
         # --- poll success: connectivity proven again -------------------------
@@ -326,14 +341,28 @@ class PollLoop:
             return True
         return prev_poll is not None and now - prev_poll > OUTAGE_TOLERANCE_SECONDS
 
-    def _failure_report(self, code: str, class_name: str) -> CycleReport:
+    def _failure_report(
+        self, code: str, class_name: str, *, category: str = "unknown",
+        duration_ms: int | None = None, retry_after: float | None = None,
+    ) -> CycleReport:
         """Failed poll: no heartbeat, no sweep, no updates, no tick — and
         therefore no channel sends. Backoff for the runner to wait on."""
+        delay = _backoff_seconds(
+            self._consecutive_failures, transient=code in {"timeout", "transport_error"}
+        )
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        logger.warning(
+            "poll failed: code=%s class=%s category=%s duration_ms=%s retry_seconds=%s",
+            code, class_name, category, duration_ms, delay,
+        )
         return CycleReport(
             ok=False,
             failure_code=code,
             failure_class=class_name,
+            failure_category=category,
+            request_duration_ms=duration_ms,
             pending_after=tuple(self._inbox.pending_ids()),
             unsafe=self._unsafe,
-            sleep_seconds=_backoff_seconds(self._consecutive_failures),
+            sleep_seconds=delay,
         )

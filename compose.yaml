@@ -1,0 +1,38 @@
+name: poster-bot
+
+services:
+  bot:
+    image: poster-bot:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    # Runtime injection only; never copied into the image. Requires Compose 2.30+.
+    env_file:
+      - path: .env
+        format: raw
+    # Override host paths from .env so both SQLite and the singleton lock persist.
+    environment:
+      POSTER_BOT_DB_PATH: /app/data/poster_bot.sqlite3
+      POSTER_BOT_LOCK_PATH: /app/data/poster_bot.lock
+    volumes:
+      - data:/app/data
+    # Manual start only; packaging must not silently enable host auto-start.
+    restart: "no"
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  data:
+    name: poster-bot-data

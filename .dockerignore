@@ -1,0 +1,10 @@
+# Runtime sources are Python-only; add any future package resources explicitly.
+# Never re-include src/**: that would admit nested secrets and SQLite sidecars.
+**
+!pyproject.toml
+# Docker retains the parent directories of these matching source files.
+# Directory negations also unignore their children, so do not add them here.
+!src/poster_bot/**/*.py
+src/**/__pycache__/**
+src/**/*.egg-info/**
+src/**/.env*

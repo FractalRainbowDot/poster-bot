@@ -3,10 +3,17 @@
 Errors never echo secret values: problem messages reference env var names only.
 Offline mode accepts dummy values; live mode rejects placeholder/missing
 token, non-positive owner id, zero channel id.
+
+The channel target is either a numeric chat id (int, existing semantics) or a
+public ``@channel-username`` (str). Usernames are validated structurally,
+offline, against Telegram's username syntax; resolving one to its stable
+numeric id is a live-startup step (see ``poster_bot.live.resolve_channel``)
+and never happens here — ``--check`` stays network-free for both forms.
 """
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -51,13 +58,30 @@ class MalformedTokenError(ConfigError):
         super().__init__([f"{env_var} is not a syntactically valid bot token"])
 
 
+class ChannelResolutionError(ConfigError):
+    """A configured ``@channel-username`` could not be resolved to its
+    numeric channel id at live startup. Raised by the live composition; the
+    message names the env var and a safe reason code only — never the
+    username, chat payloads or Telegram's error text."""
+
+    def __init__(self, env_var: str, reason: str) -> None:
+        super().__init__([f"{env_var} could not be resolved to a channel ({reason})"])
+
+
+#: Telegram channel username syntax: 5..32 chars, letter first, then letters,
+#: digits and underscores. Leading '@' required for an unambiguous target.
+_CHANNEL_USERNAME_RE = re.compile(r"@[A-Za-z][A-Za-z0-9_]{4,31}")
+
+
 @dataclass(frozen=True)
 class Config:
     # the token never appears in repr()/str(): an accidental log or traceback
     # echo of a Config must not leak it (error messages name env vars only)
     bot_token: str = field(repr=False)
     owner_user_id: int
-    channel_id: int
+    # numeric chat id (int, existing semantics) or validated @username (str);
+    # a str target is resolved to its numeric id at live startup, never here
+    channel_id: int | str
     db_path: str
     lock_path: str
     timezone: str
@@ -74,8 +98,11 @@ class Config:
             problems.append(f"{ENV_TOKEN} is missing or still a placeholder")
         if self.owner_user_id <= 0:
             problems.append(f"{ENV_OWNER} must be a positive integer for live mode")
-        if self.channel_id == 0:
-            problems.append(f"{ENV_CHANNEL} must be a non-zero integer for live mode")
+        if isinstance(self.channel_id, int) and self.channel_id == 0:
+            problems.append(
+                f"{ENV_CHANNEL} must be a non-zero numeric channel id or a "
+                "@channel-username for live mode"
+            )
         return problems
 
 
@@ -88,6 +115,31 @@ def _get_int(env: dict[str, str], name: str, problems: list[str]) -> int:
         return 0
 
 
+def _get_channel(env: dict[str, str], name: str, problems: list[str]) -> int | str:
+    """Parse the channel target: numeric chat id or validated @username.
+
+    Outer whitespace follows the config's strip convention; inner whitespace,
+    URLs and injection characters are rejected. Values are never quoted in
+    the problem message (env var name only), matching the token/owner gate.
+    """
+    raw = env.get(name, _DEFAULTS.get(name, "")).strip()
+    if raw.startswith("@"):
+        if _CHANNEL_USERNAME_RE.fullmatch(raw):
+            return raw
+        problems.append(
+            f"{name} must be a valid @channel-username "
+            "(5..32 letters, digits and underscores, letter first)"
+        )
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        problems.append(
+            f"{name} must be a numeric channel id or a valid @channel-username"
+        )
+        return 0
+
+
 def load_config(env: dict[str, str] | None = None) -> Config:
     """Load and structurally validate config (offline gate).
 
@@ -97,7 +149,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     problems: list[str] = []
     token = source.get(ENV_TOKEN, "").strip()
     owner = _get_int(source, ENV_OWNER, problems)
-    channel = _get_int(source, ENV_CHANNEL, problems)
+    channel = _get_channel(source, ENV_CHANNEL, problems)
     db_path = source.get(ENV_DB_PATH, _DEFAULTS[ENV_DB_PATH]).strip()
     lock_path = source.get(ENV_LOCK_PATH, _DEFAULTS[ENV_LOCK_PATH]).strip()
     timezone = source.get(ENV_TZ, _DEFAULTS[ENV_TZ]).strip()

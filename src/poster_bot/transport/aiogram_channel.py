@@ -24,14 +24,13 @@ from aiogram.exceptions import (
     TelegramServerError,
 )
 from aiogram.types import (
-    InputMediaAudio,
     InputMediaPhoto,
     InputMediaVideo,
     MessageEntity,
     User,
 )
 
-from poster_bot.config import Config
+from poster_bot.config import ENV_CHANNEL, Config, ConfigError
 from poster_bot.domain.content import Content, Entity
 from poster_bot.transport.ports import (
     ChannelTransport,
@@ -106,24 +105,50 @@ class AiogramChannelTransport(ChannelTransport):
     The ``bot`` parameter is duck-typed (any object exposing the used
     coroutine methods), which lets tests exercise this exact adapter code
     offline with a stub.
+
+    ``channel_id`` is the RESOLVED numeric destination: a configured
+    ``@username`` must already have been resolved to its stable numeric chat
+    id (``poster_bot.live.resolve_channel``) before composition, so no send
+    can ever silently retarget by username. ``channel_username`` (bare, no
+    leading '@') only improves permalink building for public channels; sends
+    never use it.
     """
 
-    def __init__(self, bot: Bot, *, channel_id: int, owner_id: int) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        *,
+        channel_id: int,
+        owner_id: int,
+        channel_username: str | None = None,
+    ) -> None:
+        if isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id == 0:
+            raise ValueError(
+                "channel_id must be a resolved non-zero numeric chat id"
+            )
         self._bot = bot
         self._channel_id = channel_id
         self._owner_id = owner_id
+        username = (channel_username or "").strip().removeprefix("@").strip()
+        self._channel_username = username or None
 
     # -- publish ---------------------------------------------------------
 
     def _permalink(
         self, anchor_message_id: int, *, chat_id: int | None = None, username: str | None = None
     ) -> str:
-        """Channel permalink for delivered messages (private channels use the
-        ``t.me/c/<internal-id>/<message>`` form built from the -100 chat id)."""
+        """Channel permalink for delivered messages.
 
-        chat = self._channel_id if chat_id is None else chat_id
+        Public channels link through the username (the delivered chat's own
+        username wins, else the configured one); private channels use the
+        ``t.me/c/<internal-id>/<message>`` form built from the -100 chat id.
+        A configured '@username' target must never leak into a t.me/c path."""
+
         if username:
             return f"https://t.me/{username}/{anchor_message_id}"
+        if self._channel_username:
+            return f"https://t.me/{self._channel_username}/{anchor_message_id}"
+        chat = self._channel_id if chat_id is None else chat_id
         return f"https://t.me/c/{str(abs(chat)).removeprefix('100')}/{anchor_message_id}"
 
     def _sent_single(self, message) -> Sent:
@@ -139,7 +164,15 @@ class AiogramChannelTransport(ChannelTransport):
 
     def _sent_group(self, messages) -> Sent:
         ids = tuple(m.message_id for m in messages)
-        return Sent(message_ids=ids, permalink=self._permalink(max(ids)))
+        chat = getattr(messages[0], "chat", None) if messages else None
+        return Sent(
+            message_ids=ids,
+            permalink=self._permalink(
+                max(ids),
+                chat_id=getattr(chat, "id", None),
+                username=getattr(chat, "username", None),
+            ),
+        )
 
     async def publish(self, content: Content) -> PublishOutcome:
         try:
@@ -195,21 +228,16 @@ class AiogramChannelTransport(ChannelTransport):
                 )
                 return self._sent_single(message)
             case "audio":
-                # mp3 posts ride a single-item media group so the caption is
-                # attached channel-side exactly like the editor preview.
-                messages = await self._bot.send_media_group(
+                # Bot API media groups require at least two items.
+                message = await self._bot.send_audio(
                     chat_id=target,
-                    media=[
-                        InputMediaAudio(
-                            media=content.media.file_id,
-                            caption=content.media.caption,
-                            caption_entities=to_aiogram_entities(
-                                content.media.caption_entities
-                            ),
-                        )
-                    ],
+                    audio=content.media.file_id,
+                    caption=content.media.caption,
+                    caption_entities=to_aiogram_entities(
+                        content.media.caption_entities
+                    ),
                 )
-                return self._sent_group(messages)
+                return self._sent_single(message)
             case "album":
                 caption_entities = to_aiogram_entities(content.caption_entities)
                 media = []
@@ -304,8 +332,17 @@ class AiogramChannelTransport(ChannelTransport):
 
 
 def build_transport(config: Config, *, bot: Bot | None = None) -> AiogramChannelTransport:
-    """Compose the channel-bound transport for live runtime use."""
+    """Compose the channel-bound transport for live runtime use.
 
+    A ``@username`` target must be resolved BEFORE transport composition
+    (async ``poster_bot.live.resolve_channel``): this synchronous helper
+    never guesses a destination and refuses string targets outright."""
+
+    if isinstance(config.channel_id, str):
+        raise ConfigError([
+            f"{ENV_CHANNEL} must be resolved to its numeric channel id "
+            "before transport composition"
+        ])
     return AiogramChannelTransport(
         bot if bot is not None else create_bot(config),
         channel_id=config.channel_id,

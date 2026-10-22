@@ -15,9 +15,19 @@ from poster_bot.ui.flow import OwnerFlow
 FLOW_CHANNEL = -100555
 
 
-def build_flow(services: Services) -> tuple[OwnerFlow, FakeTransport]:
+def build_flow(
+    services: Services,
+    *,
+    channel_id: int = FLOW_CHANNEL,
+    channel_username: str | None = None,
+) -> tuple[OwnerFlow, FakeTransport]:
     """OwnerFlow over the test services; previews go to the same fake
-    transport so tests can prove the channel publish path is never used."""
+    transport so tests can prove the channel publish path is never used.
+
+    ``channel_username`` mirrors the live composition: the numeric channel id
+    stays the destination, the bare/@-prefixed username only upgrades links.
+    ``channel_id`` overrides the fake channel (guard tests pass invalid
+    targets explicitly)."""
 
     services.settings.seed_defaults(SimpleNamespace(
         timezone="Europe/Moscow", slot_start_hour=0, slot_end_hour=23,
@@ -32,7 +42,8 @@ def build_flow(services: Services) -> tuple[OwnerFlow, FakeTransport]:
         manual_times=services.manual_times,
         journal=services.journal,
         preview=preview,
-        channel_id=FLOW_CHANNEL,
+        channel_id=channel_id,
+        channel_username=channel_username,
     )
     return flow, preview
 
@@ -73,6 +84,9 @@ def press(flow: OwnerFlow, token: str, *, now: int):
 
 
 def press_label(flow: OwnerFlow, reply, needle: str, *, now: int):
+    from poster_bot.ui import texts
+    if needle in (texts.MENU_NEW_POST, texts.MENU_DRAFTS, texts.MENU_PLAN, texts.MENU_SETTINGS):
+        return run(flow.menu_navigation(label=needle, now=now))
     return press(flow, find_token(reply, needle), now=now)
 
 

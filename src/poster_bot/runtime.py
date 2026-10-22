@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 
 from .db import iso
 from .journal import Journal
@@ -127,6 +128,7 @@ class Runtime:
         transport: ChannelTransport,
         journal: Journal | None = None,
         inbox: InboxRepo | None = None,
+        refresh_dashboard: Callable[[int], Awaitable[None]] | None = None,
     ) -> None:
         self._dispatch = dispatch
         self._notices = notices
@@ -135,12 +137,14 @@ class Runtime:
         self._transport = transport
         self._journal = journal
         self._inbox = inbox
+        self._refresh_dashboard = refresh_dashboard
         # in-process maintenance throttle, measured in injected runtime
         # time; durable facts stay in the DB (this only paces attempts)
         self._next_maintenance_at: int | None = None
 
     @classmethod
-    def for_app(cls, app, transport: ChannelTransport) -> "Runtime":
+    def for_app(cls, app, transport: ChannelTransport, *,
+                refresh_dashboard: Callable[[int], Awaitable[None]] | None = None) -> "Runtime":
         """Compose the runtime around an opened App (app.py stays aiogram-free;
         the live caller injects the adapter)."""
         return cls(
@@ -150,6 +154,7 @@ class Runtime:
             transport=transport,
             journal=app.journal,
             inbox=InboxRepo(app.conn),
+            refresh_dashboard=refresh_dashboard,
         )
 
     # -- polling support hooks (used by the UI stage) ----------------------
@@ -166,6 +171,15 @@ class Runtime:
         """One runtime cycle at an injected clock instant."""
         self._runtime.set_alive(now_epoch=now_epoch)
         results = await self._sender.send_due(now_epoch=now_epoch)
+        # Sender outcomes are already committed. UI retries are independently
+        # paced by the UI hook; they can never cause another channel publish.
+        # Invoked on healthy ticks only, including ticks with pending UI work
+        # but no sends, and checks its frame fingerprint before any API edit.
+        if self._refresh_dashboard is not None:
+            try:
+                await self._refresh_dashboard(now_epoch)
+            except Exception as exc:
+                logger.warning("dashboard hook failed: class=%s", type(exc).__name__)
         delivered, pending = await self.deliver_notices(now_epoch=now_epoch)
         # maintenance AFTER all sends: housekeeping must never delay or
         # endanger the due-window pipeline, and its failure changes nothing

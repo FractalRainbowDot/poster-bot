@@ -127,9 +127,9 @@ class TestInboxRepo:
         inbox.begin(12)
         inbox.complete(12)
         # offset 11 keeps update 11 in Telegram's backlog for redelivery
-        assert inbox.safe_offset() == 10
+        assert inbox.safe_offset() == 11
         inbox.complete(11)
-        assert inbox.safe_offset() == 12
+        assert inbox.safe_offset() == 13
 
     def test_rejects_non_positive_update_id(self, conn):
         with pytest.raises(ValueError):
@@ -145,5 +145,5 @@ class TestInboxRepo:
         migrate(reopened)
         fresh = InboxRepo(reopened)
         assert fresh.pending_ids() == [4]
-        assert fresh.safe_offset() == 3
+        assert fresh.safe_offset() == 4
         assert fresh.begin(4) is InboxStatus.REDO

@@ -32,6 +32,7 @@ class TestSlotScheduling:
         picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
         assert picker.text == texts.PICK_TIME
         confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=NOW)
+        confirm = press_label(flow, confirm, '12:00', now=NOW)
         assert confirm.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
         scheduled = press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
         assert scheduled.text.startswith(texts.SCHEDULED_PREFIX)
@@ -47,6 +48,7 @@ class TestSlotScheduling:
         created = _draft_created(flow)
         picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
         confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=NOW)
+        confirm = press_label(flow, confirm, '12:00', now=NOW)
         token = find_token(confirm, texts.BTN_CONFIRM)
         press(flow, token, now=NOW)
         replay = press(flow, token, now=NOW + 5)
@@ -66,6 +68,7 @@ class TestSlotScheduling:
         created = _draft_created(flow)
         picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
         confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=NOW)
+        confirm = press_label(flow, confirm, '12:00', now=NOW)
         token = find_token(confirm, texts.BTN_CONFIRM)
         press_label(flow, confirm, texts.BTN_CANCEL, now=NOW)
         stale = press(flow, token, now=NOW + 1)
@@ -77,7 +80,7 @@ class TestOwnTime:
     def _ask(self, flow, created):
         picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
         ask = press_label(flow, picker, texts.BTN_OWN_TIME, now=NOW)
-        assert texts.TIME_ASK in ask.text
+        assert 'Дата: Сегодня' in ask.text and 'Время: не выбрано' in ask.text
         return ask
 
     def test_past_time_refused_then_future_accepted(self, services):
@@ -88,8 +91,11 @@ class TestOwnTime:
         # bare ЧЧ:ММ rolls to the next future occurrence, so a truly past
         # instant needs a full date: today 09:00 MSK < now (11:00 MSK)
         past = run(flow.text(now=NOW, text="21.10.2026 09:00"))
+        past = press_label(flow, past, 'Продолжить', now=NOW)
         assert past.text.startswith(texts.TIME_NOT_FUTURE)
+        press_label(flow, past, 'Время', now=NOW)
         good = run(flow.text(now=NOW, text="15:00"))
+        good = press_label(flow, good, 'Продолжить', now=NOW)
         assert good.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
         press_label(flow, good, texts.BTN_CONFIRM, now=NOW)
         pub = services.publications.get_by_post(post_id)
@@ -103,6 +109,7 @@ class TestOwnTime:
         created = _draft_created(flow)
         ask = self._ask(flow, created)
         good = run(flow.text(now=NOW, text="22.10.2026 14:30"))
+        good = press_label(flow, good, 'Продолжить', now=NOW)
         assert good.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
         press_label(flow, good, texts.BTN_CONFIRM, now=NOW)
         pub = services.publications.get_by_post(_post_id(created.text))
@@ -124,6 +131,7 @@ class TestOwnTime:
         post_id = _post_id(created.text)
         picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
         confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=NOW)
+        confirm = press_label(flow, confirm, '12:00', now=NOW)
         # another post wins the same minute between view and confirmation
         rival = services.drafts.create(text_content(), now_epoch=NOW)
         services.publications.schedule(rival, future(minutes=60), now_epoch=NOW)
@@ -145,6 +153,7 @@ class TestRecentSuggestions:
         # record 16:40 via a far date so its minute stays free for the
         # suggestion's natural next occurrence (today 16:40)
         good = run(flow.text(now=NOW, text="25.10.2026 16:40"))
+        good = press_label(flow, good, 'Продолжить', now=NOW)
         press_label(flow, good, texts.BTN_CONFIRM, now=NOW)
 
         second = _draft_created(flow)

@@ -14,8 +14,16 @@ Startup order is a reliability contract (PLAN §6):
 2. Bot API token SYNTAX check (aiogram's own validator). A malformed token
    raises ``MalformedTokenError`` naming only the env var — the value is
    never echoed — and the already-acquired lock/DB are released;
-3. transport/flow/router/dispatcher composed over the SAME app connection;
-4. the loop then polls getUpdates with the durable inbox offset, feeds
+3. channel TARGET resolution: a numeric id is used as configured (no call);
+   a configured ``@channel-username`` is resolved via getChat to its stable
+   numeric chat id, accepted only as a ``channel``-type chat with a negative
+   numeric id. Any refusal raises ``ChannelResolutionError`` (env var and
+   safe reason only) BEFORE any transport/flow is composed or any send is
+   possible, and releases the bot session plus the lock/DB;
+4. transport/flow/router/dispatcher composed over the SAME app connection,
+   all bound to the ONE resolved numeric destination (public username is
+   carried only for building correct t.me links);
+5. the loop then polls getUpdates with the durable inbox offset, feeds
    updates through the owner router, and ticks the runtime after every
    successful poll.
 
@@ -25,8 +33,11 @@ session and the app (flock + DB released) and journals ``poller_stopped``.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import signal
+import socket
+import time
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
@@ -34,14 +45,22 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramNetworkError,
+    TelegramRetryAfter,
     TelegramServerError,
     TelegramUnauthorizedError,
 )
 from aiogram.types import Update
 from aiogram.utils.token import TokenValidationError, validate_token
+from aiohttp import ClientConnectorError
 
 from .app import App, open_for_run
-from .config import ENV_TOKEN, Config, MalformedTokenError
+from .config import (
+    ENV_CHANNEL,
+    ENV_TOKEN,
+    ChannelResolutionError,
+    Config,
+    MalformedTokenError,
+)
 from .polling import (
     ALLOWED_UPDATES,
     GET_UPDATES_LIMIT,
@@ -55,6 +74,7 @@ from .runtime import Runtime
 from .transport.aiogram_channel import AiogramChannelTransport, create_bot
 from .ui.flow import OwnerFlow
 from .ui.handlers import create_ui_router
+from .ui.dashboard_presentation import DashboardPresentation
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +83,99 @@ logger = logging.getLogger(__name__)
 StartedCallback = Callable[[tuple[int, ...]], None]
 
 
+@dataclass(frozen=True)
+class ResolvedChannel:
+    """The ONE destination every live component shares.
+
+    ``channel_id`` is always the stable numeric chat id publishes/preview
+    copies target; ``username`` (bare, no leading '@') is carried only to
+    build correct public t.me links and is never a send destination."""
+
+    channel_id: int
+    username: str | None = None
+
+
+async def resolve_channel(bot: Bot, *, channel_id: int | str) -> ResolvedChannel:
+    """Resolve the configured target to its numeric channel id.
+
+    Numeric targets are returned as-is (existing behavior: no extra call).
+    A ``@username`` is resolved with one getChat and accepted only as a
+    ``channel``-type chat with a negative numeric id — a group or private
+    chat behind that username is refused, never published into. Failures
+    raise ``ChannelResolutionError`` naming only the env var and a safe
+    reason code: Telegram's error text, chat payloads and the token never
+    leave this function."""
+    if isinstance(channel_id, str):
+        try:
+            chat = await bot.get_chat(chat_id=channel_id)
+        except (asyncio.TimeoutError, TelegramNetworkError, TelegramServerError):
+            raise ChannelResolutionError(
+                ENV_CHANNEL, "Telegram not reachable"
+            ) from None
+        except TelegramAPIError:
+            raise ChannelResolutionError(
+                ENV_CHANNEL, "chat is not accessible to this bot"
+            ) from None
+        except Exception as exc:  # unknown adapter-level failure: class name
+            raise ChannelResolutionError(  # is a safe code, never the message
+                ENV_CHANNEL, type(exc).__name__
+            ) from None
+        if (
+            getattr(chat, "type", None) != "channel"
+            or not isinstance(getattr(chat, "id", None), int)
+            or chat.id >= 0
+        ):
+            raise ChannelResolutionError(
+                ENV_CHANNEL, "target is not a channel chat"
+            ) from None
+        return ResolvedChannel(channel_id=chat.id, username=channel_id[1:])
+    return ResolvedChannel(channel_id=channel_id)
+
+
+def _network_failure_category(exc: BaseException) -> str:
+    """Inspect types/errno only; aiogram chains its original aiohttp cause.
+
+    Never parse/stringify exceptions: aiohttp messages can contain token URLs.
+    Bound traversal, including when malformed cause chains contain a cycle.
+    """
+    causes = []
+    current: BaseException | None = exc
+    for _ in range(8):
+        if current is None or any(current is item for item in causes):
+            break
+        causes.append(current)
+        current = current.__cause__ or current.__context__
+    if any(isinstance(item, (TimeoutError, asyncio.TimeoutError)) for item in causes):
+        return "timeout"
+    if any(isinstance(item, socket.gaierror) for item in causes):
+        return "dns"
+    if any(
+        isinstance(item, (ClientConnectorError, ConnectionRefusedError))
+        or (isinstance(item, OSError) and item.errno in {
+            errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH,
+        })
+        for item in causes
+    ):
+        return "connect"
+    return "network"
+
+
 class AiogramUpdateSource:
     """getUpdates adapter: maps aiogram exceptions onto safe poll codes.
 
     Only class classifications ever leave this adapter — never Telegram's
     message text, payloads or the token."""
 
-    def __init__(self, bot: Bot) -> None:
+    def __init__(
+        self, bot: Bot, *, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
         self._bot = bot
+        self._monotonic = monotonic
 
     async def fetch(
         self, *, offset: int | None, timeout: int
     ) -> Sequence[UpdateLike]:
+        started = self._monotonic()
         try:
             return await self._bot.get_updates(
                 offset=offset,
@@ -86,17 +187,33 @@ class AiogramUpdateSource:
             # token revoked/invalid: backing off would hammer forever
             raise PollFatal("unauthorized") from None
         except Exception as exc:
+            duration_ms = max(0, int((self._monotonic() - started) * 1000))
+            retry_after = None
             match exc:
-                case TimeoutError():
-                    raise PollFailure("timeout") from None
-                case TelegramNetworkError() | TelegramServerError():
-                    raise PollFailure("transport_error") from None
+                case TelegramRetryAfter():
+                    code, category, class_name = (
+                        "rate_limit", "rate_limit", "TelegramRetryAfter"
+                    )
+                    retry_after = exc.retry_after
+                case TimeoutError() | asyncio.TimeoutError():
+                    code, category, class_name = "timeout", "timeout", "TimeoutError"
+                case TelegramNetworkError():
+                    code, category, class_name = (
+                        "transport_error", _network_failure_category(exc),
+                        "TelegramNetworkError",
+                    )
+                case TelegramServerError():
+                    code, category, class_name = (
+                        "transport_error", "server", "TelegramServerError"
+                    )
                 case TelegramAPIError():
-                    raise PollFailure("api_error") from None
+                    code, category, class_name = "api_error", "api", "TelegramAPIError"
                 case _:
-                    # unknown adapter-level failure: class name is a safe
-                    # diagnostic code, never the message text
-                    raise PollFailure(type(exc).__name__) from None
+                    code, category, class_name = "unclassified", "unknown", "Exception"
+            raise PollFailure(
+                code, failure_class=class_name, category=category,
+                request_duration_ms=duration_ms, retry_after=retry_after,
+            ) from None
 
 
 class DispatcherUpdateHandler:
@@ -156,7 +273,7 @@ class Live:
         self.app.close()
 
 
-def compose_live(
+async def compose_live(
     config: Config,
     *,
     clock: Callable[[], int],
@@ -165,8 +282,9 @@ def compose_live(
 ) -> Live:
     """Build the live object graph over a freshly opened App.
 
-    Any failure after ``open_for_run`` releases the lock and DB before
-    propagating. ``bot`` is injected only by offline tests."""
+    Any failure after ``open_for_run`` releases the lock, DB and (once
+    created) the bot session before propagating. ``bot`` is injected only by
+    offline tests."""
     app = open_for_run(config, now_epoch=now_epoch)
     try:
         try:
@@ -174,12 +292,23 @@ def compose_live(
         except TokenValidationError:
             raise MalformedTokenError(ENV_TOKEN) from None
         the_bot = bot if bot is not None else create_bot(config)
+        try:
+            resolved = await resolve_channel(the_bot, channel_id=config.channel_id)
+        except BaseException:
+            # no Live exists yet to close the session: release it here so a
+            # refused resolution never strands an HTTP client
+            try:
+                await the_bot.session.close()
+            except Exception as exc:  # release the app below regardless
+                logger.warning("bot session close failed: %s", type(exc).__name__)
+            raise
         # composed directly to keep the whole live graph visible in one place;
-        # build_transport(config, bot=...) is the identical wiring for callers
+        # every component shares the ONE resolved numeric destination
         transport = AiogramChannelTransport(
             the_bot,
-            channel_id=config.channel_id,
+            channel_id=resolved.channel_id,
             owner_id=config.owner_user_id,
+            channel_username=resolved.username,
         )
         flow = OwnerFlow(
             conn=app.conn,
@@ -190,15 +319,20 @@ def compose_live(
             manual_times=app.manual_times,
             journal=app.journal,
             preview=transport,
-            channel_id=config.channel_id,
+            channel_id=resolved.channel_id,
+            channel_username=resolved.username,
         )
+        dashboard = DashboardPresentation(flow, owner_id=config.owner_user_id)
         router = create_ui_router(
-            flow, owner_id=config.owner_user_id, clock=clock
+            flow, owner_id=config.owner_user_id, clock=clock, dashboard=dashboard,
         )
         dispatcher = Dispatcher()
         dispatcher.include_router(router)
         inbox = InboxRepo(app.conn)
-        runtime = Runtime.for_app(app, transport)
+        async def refresh_dashboard(now: int) -> None:
+            await dashboard.refresh(the_bot, now=now)
+
+        runtime = Runtime.for_app(app, transport, refresh_dashboard=refresh_dashboard)
         loop = PollLoop(
             source=AiogramUpdateSource(the_bot),
             handler=DispatcherUpdateHandler(dispatcher, the_bot),
@@ -237,7 +371,7 @@ async def run_live(
     """Poll until ``stop_event`` fires (or a signal sets it), then release
     everything. Raises ``PollFatal`` after clean cleanup for the CLI to map
     to an exit code; never retries a fatal condition."""
-    live = compose_live(config, clock=clock, bot=bot, now_epoch=now_epoch)
+    live = await compose_live(config, clock=clock, bot=bot, now_epoch=now_epoch)
     stop = stop_event if stop_event is not None else asyncio.Event()
     installed: list[signal.Signals] = []
     if install_signals:

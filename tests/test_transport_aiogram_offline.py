@@ -82,6 +82,9 @@ class StubBot:
     async def send_video(self, **kwargs):
         return self._respond("send_video", kwargs)
 
+    async def send_audio(self, **kwargs):
+        return self._respond("send_audio", kwargs)
+
     async def send_media_group(self, **kwargs):
         return self._respond("send_media_group", kwargs)
 
@@ -137,14 +140,21 @@ class TestSingleSends:
         assert isinstance(run(transport(bot).publish(content)), Sent)
         assert bot.calls[0][0] == "send_video"
 
-    def test_audio_travels_single_item_media_group(self):
-        bot = StubBot(result=[message(10)])
-        content = Content(kind="audio", media=MediaRef("audio", "au1", caption="mp3"))
-        outcome = run(transport(bot).publish(content))
-        assert isinstance(outcome, Sent)
-        media = bot.calls[0][1]["media"]
-        assert len(media) == 1 and media[0].media == "au1"
-        assert media[0].caption == "mp3"
+    @pytest.mark.parametrize("preview", [False, True])
+    def test_single_audio_uses_send_audio_not_invalid_one_item_group(self, preview):
+        bot = StubBot(result=message(10))
+        content = Content(kind="audio", media=MediaRef(
+            "audio", "au1", caption="mp3",
+            caption_entities=(Entity("bold", 0, 3),)))
+        adapter = transport(bot)
+        outcome = run(adapter.send_preview(content) if preview else adapter.publish(content))
+        assert outcome == Sent((10,), "" if preview else "https://t.me/c/1234567890/10")
+        assert len(bot.calls) == 1
+        name, payload = bot.calls[0]
+        assert name == "send_audio"
+        assert payload["chat_id"] == (OWNER if preview else CHANNEL)
+        assert payload["audio"] == "au1" and payload["caption"] == "mp3"
+        assert payload["caption_entities"][0].type == "bold"
 
 
 class TestAlbumAndForward:
@@ -205,6 +215,103 @@ class TestAlbumAndForward:
 
 def api_method():
     return SendMessage(chat_id=1, text="x")
+
+
+class TestConfiguredUsernameTarget:
+    """A @username config arrives already RESOLVED: sends target the numeric
+    id; the username only upgrades permalinks to the public t.me form."""
+
+    def transport(self, bot):
+        return AiogramChannelTransport(
+            bot, channel_id=CHANNEL, owner_id=OWNER,
+            channel_username="@test_chan_public2",
+        )
+
+    def test_single_send_targets_numeric_id_with_username_permalink(self):
+        bot = StubBot(result=message(7))  # chat payload carries no username
+        outcome = run(self.transport(bot).publish(text_content("hello")))
+        assert outcome == Sent(
+            message_ids=(7,), permalink="https://t.me/test_chan_public2/7"
+        )
+        _, kwargs = bot.calls[0]
+        assert kwargs["chat_id"] == CHANNEL  # never the username string
+
+    def test_delivered_chat_username_wins_over_configured(self):
+        bot = StubBot(result=message(7, username="actual_name"))
+        outcome = run(self.transport(bot).publish(text_content("hello")))
+        assert outcome.permalink == "https://t.me/actual_name/7"
+
+    def test_album_uses_configured_username_fallback(self):
+        bot = StubBot(result=[message(20), message(21)])
+        content = Content(
+            kind="album",
+            items=(MediaRef("photo", "p1"), MediaRef("video", "v1")),
+            caption="album text",
+        )
+        outcome = run(self.transport(bot).publish(content))
+        assert outcome.permalink == "https://t.me/test_chan_public2/21"
+
+    def test_forward_without_chat_payload_uses_configured_username(self):
+        bot = StubBot(result=[message_id(30), message_id(31)])
+        content = Content(kind="forward", mode="forward",
+                          forward=ForwardSource(chat_id=-100777, message_ids=(5, 6)))
+        outcome = run(self.transport(bot).publish(content))
+        assert outcome.permalink == "https://t.me/test_chan_public2/31"
+
+    def test_group_message_chat_username_produces_public_link(self):
+        bot = StubBot(result=[
+            message(40, username="public_chan"), message(41, username="public_chan"),
+        ])
+        content = Content(
+            kind="album",
+            items=(MediaRef("photo", "p1"), MediaRef("video", "v1")),
+        )
+        outcome = run(self.transport(bot).publish(content))
+        assert outcome.permalink == "https://t.me/public_chan/41"
+
+    def test_preview_permalink_stays_empty_for_owner_copy(self):
+        bot = StubBot(result=[message_id(99)])
+        outcome = run(self.transport(bot).preview_sent(7))
+        assert isinstance(outcome, Sent) and outcome.permalink == ""
+
+    def test_bare_and_at_prefixed_usernames_are_equivalent(self):
+        bot = StubBot(result=message(7))
+        bare = AiogramChannelTransport(
+            bot, channel_id=CHANNEL, owner_id=OWNER, channel_username="name_one"
+        )
+        prefixed = AiogramChannelTransport(
+            bot, channel_id=CHANNEL, owner_id=OWNER, channel_username="@name_one"
+        )
+        assert run(bare.publish(text_content("x"))).permalink == \
+            run(prefixed.publish(text_content("x"))).permalink == \
+            "https://t.me/name_one/7"
+
+    @pytest.mark.parametrize("bad_target", ["@chan_one", "chan_one", 0, None, True])
+    def test_constructor_refuses_unresolved_or_placeholder_targets(self, bad_target):
+        with pytest.raises(ValueError):
+            AiogramChannelTransport(StubBot(), channel_id=bad_target, owner_id=OWNER)
+
+    def test_build_transport_refuses_unresolved_username_config(self):
+        from poster_bot.config import (
+            ENV_CHANNEL,
+            ENV_OWNER,
+            ENV_TOKEN,
+            ConfigError,
+            load_config,
+        )
+
+        config = load_config(
+            {ENV_TOKEN: "123:fake-offline", ENV_OWNER: str(OWNER),
+             ENV_CHANNEL: "@test_chan_public2"}
+        )
+        with pytest.raises(ConfigError) as caught:
+            build_transport(config, bot=StubBot())
+        assert ENV_CHANNEL in _all(caught.value)
+        assert "@test_chan_public2" not in _all(caught.value)
+
+
+def _all(exc) -> str:
+    return " | ".join(exc.problems)
 
 
 class TestErrorClassification:
