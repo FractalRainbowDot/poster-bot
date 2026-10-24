@@ -27,6 +27,7 @@ from ..domain.content import (
     ForwardSource,
     MediaRef,
 )
+from ..domain.planner import LogicalPost
 
 ALBUM_ITEM_KINDS = ("photo", "video")
 
@@ -44,7 +45,7 @@ class Staged:
     """One content-in-progress. Exactly one branch is active at a time
     (kind None = empty)."""
 
-    kind: str | None = None  # text | media | album | forward
+    kind: str | None = None  # text | media | album | forward | logical (candidate only)
     # text branch
     text: str | None = None
     entities: tuple[Entity, ...] = ()
@@ -61,6 +62,9 @@ class Staged:
     forward_ids: list[int] = field(default_factory=list)
     forward_group_id: str | None = None
     copy: "Staged | None" = None  # editable-copy candidate (media/album/text)
+    # Incoming planned forwards are logical snapshots, NOT outbound Content.
+    # Kept under the forward branch until the owner explicitly approves copying.
+    logical_copy: LogicalPost | None = None
 
     @property
     def empty(self) -> bool:
@@ -125,12 +129,15 @@ class Staged:
             self.kind == "forward"
             and self.forward_chat_id == chat_id
             and media_group_id is not None
-            and self.forward_group_id in (None, media_group_id)
+            and self.forward_group_id == media_group_id
         ):
             self.forward_group_id = media_group_id
             self.forward_ids.append(message_id)
             if self.copy is not None:
-                if copy_candidate.kind == "media" and copy_candidate.media:
+                if self.copy.logical_copy is not None or copy_candidate.logical_copy is not None:
+                    from .intake import merge_forward_candidates
+                    self.copy = merge_forward_candidates(self.copy, copy_candidate)
+                elif copy_candidate.kind == "media" and copy_candidate.media:
                     self.copy.add_media(
                         copy_candidate.media.kind,
                         copy_candidate.media.file_id,
@@ -228,6 +235,8 @@ class Staged:
     # ---- JSON persistence (durable across restarts) -------------------------
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"kind": self.kind}
+        if self.logical_copy is not None:
+            data["logical_copy"] = self.logical_copy.to_json()
         if self.text is not None:
             data["text"] = self.text
             data["entities"] = entities_to_json(self.entities)
@@ -252,6 +261,8 @@ class Staged:
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "Staged":
         staged = Staged(kind=data.get("kind"))
+        if isinstance(data.get("logical_copy"), str):
+            staged.logical_copy = LogicalPost.from_json(data["logical_copy"])
         staged.text = data.get("text")
         staged.entities = entities_from_json(data.get("entities", []))
         if isinstance(data.get("media"), dict):

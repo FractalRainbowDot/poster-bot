@@ -26,11 +26,16 @@ from aiogram.exceptions import (
     TelegramUnauthorizedError,
 )
 from aiogram.methods import GetChat, GetUpdates
+from aiogram.types import ReplyKeyboardMarkup
 from conftest import NOW, text_content
 from test_ui_handlers_offline import _FakeApiSession
 
 from poster_bot.config import (
     ENV_CHANNEL,
+    ENV_SIG_MAIN_TEXT,
+    ENV_SIG_MAIN_URL,
+    ENV_SIG_PARTNER_TEXT,
+    ENV_SIG_PARTNER_URL,
     ENV_TOKEN,
     ChannelResolutionError,
     Config,
@@ -42,6 +47,8 @@ from poster_bot.polling import POLL_TIMEOUT_SECONDS
 from poster_bot.singleton import ProcessLock
 from poster_bot.transport.ports import Sent
 from poster_bot.ui import texts
+from poster_bot.ui.navigation import NavigationStore
+from planned_helpers import SIG
 
 OWNER = 111
 CHANNEL = -100222
@@ -60,6 +67,7 @@ def live_config(tmp_path, **over) -> Config:
         timezone="Europe/Moscow",
         slot_start_hour=0,
         slot_end_hour=23,
+        signature=SIG,
     )
     base.update(over)
     return Config(**base)
@@ -508,29 +516,33 @@ class TestChannelTargetResolution:
             report = asyncio.run(live.loop.run_cycle())
             assert report.ok and report.handled == 1
             # Telegram needs separate messages for the persistent input menu
-            # and inline service card. Both must remain private after resolution.
+            # and service card. Both must remain private after resolution.
             assert session.sent_chats() == [OWNER, OWNER]
             sends = [p for name, p in session.requests if name == "sendMessage"]
             keyboard_messages = [p for p in sends
                                  if "keyboard" in p.get("reply_markup", {})]
-            card_messages = [p for p in sends
-                             if "inline_keyboard" in p.get("reply_markup", {})]
-            assert len(keyboard_messages) == len(card_messages) == 1
-            keyboard = keyboard_messages[0]["reply_markup"]
-            assert keyboard["resize_keyboard"] is True
-            assert keyboard["is_persistent"] is True
-            assert [[b["text"] for b in row] for row in keyboard["keyboard"]] == [
+            assert len(keyboard_messages) == 1
+            keyboard = ReplyKeyboardMarkup.model_validate(
+                keyboard_messages[0]["reply_markup"]
+            )
+            assert keyboard.resize_keyboard is True
+            assert keyboard.is_persistent is True
+            assert [[b.text for b in row] for row in keyboard.keyboard] == [
                 [texts.MENU_NEW_POST, texts.MENU_DRAFTS],
                 [texts.MENU_PLAN, texts.MENU_SETTINGS],
-                [texts.MENU_RESTART],
+                [texts.MENU_JOURNAL, texts.MENU_RESTART],
             ]
-            card = card_messages[0]
-            assert card["text"] == "📅 Контент-план\nНет запланированных публикаций."
-            assert "Нет запланированных публикаций" in card["text"]
-            buttons = [b for row in card["reply_markup"]["inline_keyboard"]
-                       for b in row]
-            assert [b["text"] for b in buttons] == [texts.MENU_JOURNAL]
-            assert all(b.get("callback_data") and not b.get("url") for b in buttons)
+            assert texts.MENU_JOURNAL in [
+                b.text for row in keyboard.keyboard for b in row
+            ]
+            card_id = NavigationStore(live.app.conn, OWNER).get(OWNER)
+            assert card_id is not None
+            card = session.visible[card_id]
+            assert card in sends and card != keyboard_messages[0]
+            assert card["text"] == f"{texts.PLAN_DAY_PREFIX}21.10.2026 (Europe/Moscow): {texts.NO_PLANS_DAY}"
+            assert [[b["text"] for b in row] for row in
+                    card["reply_markup"]["inline_keyboard"]] == [
+                        ["← Пред.", "Сегодня", "След. →"], ["Создать пост"]]
             # Check all chat-addressed operations, not just text sends: neither
             # the numeric channel nor its username may receive UI output.
             assert all(p["chat_id"] == OWNER for _, p in session.requests
@@ -612,3 +624,32 @@ class TestChannelTargetResolution:
         assert len(session.poll_calls) == 1
         assert not [n for n, _ in session.requests if n == "sendMessage"]
         assert session.closed and lock_free(config)
+
+
+class TestSignatureGate:
+    """Live startup refuses to compose a sender without the mandatory
+    signature (unsigned publishes would otherwise reach the channel)."""
+
+    def test_missing_signature_refused_before_any_network_call(self, tmp_path):
+        config = live_config(tmp_path, channel_id="@chan", signature=None)
+        session = ResolvingApiSession()
+        with pytest.raises(ConfigError) as exc:
+            asyncio.run(compose_live(config, clock=lambda: NOW,
+                                     bot=make_bot(session), now_epoch=NOW))
+        message = str(exc.value)
+        for name in (ENV_SIG_MAIN_TEXT, ENV_SIG_MAIN_URL,
+                     ENV_SIG_PARTNER_TEXT, ENV_SIG_PARTNER_URL):
+            assert name in message
+        # strictly before create_bot/resolve_channel: no session use at all
+        assert session.requests == []
+        assert session.chat_calls == []
+        assert lock_free(config)
+
+    def test_token_check_precedes_signature_gate(self, tmp_path):
+        config = live_config(tmp_path, bot_token=BAD_TOKEN, signature=None)
+        session = LiveApiSession()
+        with pytest.raises(MalformedTokenError):
+            asyncio.run(compose_live(config, clock=lambda: NOW,
+                                     bot=make_bot(session), now_epoch=NOW))
+        assert session.requests == []
+        assert lock_free(config)

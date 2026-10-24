@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Any
 
 from aiogram import Bot, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -31,8 +31,10 @@ from aiogram.types import (
 )
 
 from ..domain.content import ContentValidationError, Entity
+from ..domain.planner import LogicalPost
 from .flow import OwnerFlow
 from .guards import is_owner_private
+from .intake import forward_media_candidate
 from .replies import TEXT_MAX, Reply
 from .staged import Staged, copy_candidate_from_media, copy_candidate_from_text
 from . import texts
@@ -117,29 +119,33 @@ def _forward_source(message: Message) -> tuple[int, int] | None:
     return int(message.chat.id), int(message.message_id)
 
 
-def _copy_candidate(message: Message) -> Staged:
+def _copy_candidate(message: Message, *, planned: bool = False) -> Staged:
     """Editable-copy parts of a forwarded message (media file ids are bot
     scoped but reusable; text copies verbatim)."""
 
+    media_candidate = forward_media_candidate if planned else copy_candidate_from_media
     if message.photo:
-        return copy_candidate_from_media(
+        return media_candidate(
             "photo", message.photo[-1].file_id, message.caption,
             to_domain_entities(message.caption_entities),
             message.media_group_id,
         )
     if message.video:
-        return copy_candidate_from_media(
+        return media_candidate(
             "video", message.video.file_id, message.caption,
             to_domain_entities(message.caption_entities),
             message.media_group_id,
         )
     if message.audio:
-        return copy_candidate_from_media(
+        return media_candidate(
             "audio", message.audio.file_id, message.caption,
             to_domain_entities(message.caption_entities),
             message.media_group_id,
         )
     if message.text:
+        if planned:
+            return Staged(kind="logical", logical_copy=LogicalPost(
+                body=message.text, entities=to_domain_entities(message.entities)))
         return copy_candidate_from_text(
             message.text, to_domain_entities(message.entities)
         )
@@ -210,45 +216,63 @@ def create_ui_router(
 
     router.message.outer_middleware(serialized)
     router.callback_query.outer_middleware(serialized)
-    menu_labels = (texts.MENU_NEW_POST, texts.MENU_DRAFTS,
-                   texts.MENU_PLAN, texts.MENU_SETTINGS)
 
-    async def deliver(bot: Bot, chat_id: int, reply: Reply) -> None:
+    async def deliver(bot: Bot, chat_id: int, reply: Reply) -> Reply:
+        reply, preview_complete = await flow.review_reply(reply, now=now_fn())
+        if reply.stale_callback:
+            return reply
         parts = _chunks(reply.text)
         for part in parts[:-1]:
             await bot.send_message(chat_id=chat_id, text=part)
-        await present(bot, chat_id, parts[-1], _keyboard(reply), navigation,
-                      now=now_fn())
+        try:
+            await present(bot, chat_id, parts[-1], _keyboard(reply), navigation,
+                          now=now_fn())
+        except Exception:
+            # Acknowledged preview parts remain durably known but may never
+            # replace the last complete stack without their fresh controls.
+            flow.review_delivery_failed(reply, now=now_fn())
+            raise
         dashboard.presented(reply)
+        try:
+            if preview_complete:
+                navigation.lifecycle.presented(keep_preview=flow.preview_context(), now=now_fn())
+            await navigation.lifecycle.cleanup(
+                bot, chat_id, now=now_fn(),
+                protected={navigation.get(chat_id), navigation.keyboard_message(chat_id)},
+                source_referenced=flow.forward_source_referenced,
+            )
+        except Exception:
+            pass  # cosmetic cleanup must never replay a business operation
+        return reply
 
     def allowed(message: Message) -> bool:
         return message_allowed(message, owner_id=owner_id)
 
-    @router.message(lambda message: message.text == texts.MENU_RESTART
+    @router.message(lambda message: texts.MENU_ALIASES.get(message.text) == texts.MENU_RESTART
                     and message.forward_origin is None)
+    @router.message(Command("cancel"), lambda message: message.forward_origin is None)
     @router.message(CommandStart())
     async def on_start(message: Message) -> None:
         if not allowed(message):
             return
-        reply = await flow.command_start(now=now_fn())
+        if texts.MENU_ALIASES.get(message.text) == texts.MENU_RESTART:
+            reply = await flow.menu_navigation(label=texts.MENU_RESTART, now=now_fn())
+        else:
+            reply = await flow.command_start(now=now_fn())
         # Telegram cannot combine reply and inline keyboards on one message.
         # Reinstall on every /start or Рестарт: local history clearing is invisible to us.
         # Only our durably tracked prompt is eligible for replacement cleanup.
-        old_prompt = navigation.keyboard_message(message.chat.id)
         prompt = await message.bot.send_message(
             chat_id=message.chat.id, text="Меню доступно под полем ввода.",
             reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text=label) for label in menu_labels[:2]],
-                          [KeyboardButton(text=label) for label in menu_labels[2:]],
-                          [KeyboardButton(text=texts.MENU_RESTART)]],
+                keyboard=[[KeyboardButton(text=label) for label in row]
+                          for row in texts.BOTTOM_MENU_ROWS],
                 resize_keyboard=True, is_persistent=True))
         try:
             navigation.record_keyboard(message.chat.id, prompt.message_id, now=now_fn())
         except Exception:
             await delete_best_effort(message.bot, message.chat.id, prompt.message_id)
             raise
-        if old_prompt is not None:
-            await delete_best_effort(message.bot, message.chat.id, old_prompt)
         await deliver(message.bot, message.chat.id, reply)
         await delete_best_effort(message.bot, message.chat.id, message.message_id)
 
@@ -257,7 +281,7 @@ def create_ui_router(
         if not allowed(message):
             return  # unauthorized traffic gets no reply at all
         now = now_fn()
-        if (message.text in (*menu_labels, texts.LEGACY_MENU_DRAFTS)
+        if (message.text in texts.MENU_ALIASES
                 and message.forward_origin is None):
             reply = await flow.menu_navigation(label=message.text, now=now)
             await deliver(message.bot, message.chat.id, reply)
@@ -267,15 +291,36 @@ def create_ui_router(
         # the flow's committed effect and inbox.complete) replays idempotently
         # inside the flow instead of duplicating intake effects
         source_key = f"{message.chat.id}:{message.message_id}"
+        discardable = flow.discardable_context()
+
+        async def finish_input(reply):
+            reply = await deliver(message.bot, message.chat.id, reply)
+            # No receipt on failed business/state writes or failed guidance delivery.
+            # Content/forward capture states are never eligible for rejection purge.
+            if discardable and not flow.input_finished(source_key):
+                flow.discard_input(source_key, now=now)
+            if flow.input_finished(source_key) and not reply.retain_input:
+                await delete_best_effort(message.bot, message.chat.id, message.message_id)
+
+        if flow.input_discarded(source_key):
+            await finish_input(flow.discarded_input_reply(now=now))
+            return
         # service messages carry no sender and are dropped silently by the
         # guard above (flow.service_message stays the documented no-op)
         forwarded_from = _forward_source(message)
         if forwarded_from is not None:
             try:
-                copy_candidate = _copy_candidate(message)
-            except ContentValidationError as exc:
-                reply = flow.content_rejected(now=now, exc=exc)
-                await deliver(message.bot, message.chat.id, reply)
+                copy_candidate = _copy_candidate(message, planned=flow._planned())
+                if copy_candidate.empty:
+                    raise ContentValidationError("unsupported forwarded content")
+            except ContentValidationError:
+                await deliver(message.bot, message.chat.id,
+                              flow.forward_rejected_reply(now=now))
+                if flow.discard_rejected_forward(chat_id=message.chat.id,
+                                                message_id=message.message_id,
+                                                now=now):
+                    await delete_best_effort(message.bot, message.chat.id,
+                                             message.message_id)
                 return
             reply = await flow.forwarded(
                 now=now,
@@ -286,6 +331,10 @@ def create_ui_router(
                 source_key=source_key,
             )
             await deliver(message.bot, message.chat.id, reply)
+            if (reply.rejected_forward and not reply.retain_input
+                    and flow.discard_rejected_forward(
+                        chat_id=message.chat.id, message_id=message.message_id, now=now)):
+                await delete_best_effort(message.bot, message.chat.id, message.message_id)
             return
         if message.text is not None:
             reply = await flow.text(
@@ -294,9 +343,7 @@ def create_ui_router(
                 entities=to_domain_entities(message.entities),
                 source_key=source_key,
             )
-            await deliver(message.bot, message.chat.id, reply)
-            if flow.input_captured(source_key):
-                await delete_best_effort(message.bot, message.chat.id, message.message_id)
+            await finish_input(reply)
             return
         media = None
         if message.photo:
@@ -315,12 +362,10 @@ def create_ui_router(
                 media_group_id=message.media_group_id,
                 source_key=source_key,
             )
-            await deliver(message.bot, message.chat.id, reply)
-            if flow.input_captured(source_key):
-                await delete_best_effort(message.bot, message.chat.id, message.message_id)
+            await finish_input(reply)
             return
         reply = flow.unsupported(now=now)
-        await deliver(message.bot, message.chat.id, reply)
+        await finish_input(reply)
 
     @router.callback_query()
     async def on_callback(query: CallbackQuery) -> None:
@@ -356,7 +401,9 @@ def create_ui_router(
             return  # even a failed toast must leave the active card untouched
         await deliver(query.bot, message.chat.id, reply)
         for chat_id, message_id in reply.released_inputs:
-            if chat_id == owner_id and flow.input_captured(f"{chat_id}:{message_id}"):
+            if (chat_id == owner_id and flow.input_captured(f"{chat_id}:{message_id}")
+                    and not flow.forward_source_referenced(
+                        chat_id=chat_id, message_id=message_id)):
                 await delete_best_effort(query.bot, chat_id, message_id)
 
     return router

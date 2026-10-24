@@ -35,6 +35,7 @@ from poster_bot.domain.content import Content, Entity
 from poster_bot.transport.ports import (
     ChannelTransport,
     DefinitiveFailure,
+    NavEditRequest,
     PublishOutcome,
     Sent,
     TransportCallError,
@@ -280,10 +281,18 @@ class AiogramChannelTransport(ChannelTransport):
                     from_chat_id=content.forward.chat_id,
                     message_ids=requested,
                 )
-                if len(returned) < len(requested):
+                ids = (tuple(getattr(item, "message_id", None) for item in returned)
+                       if isinstance(returned, (list, tuple)) else ())
+                confirmed = tuple(dict.fromkeys(mid for mid in ids
+                                  if type(mid) is int and mid > 0))
+                if not isinstance(returned, (list, tuple)) or len(returned) != len(requested):
                     # Telegram silently skips unavailable sources: a partial
                     # album cannot be auto-fixed, so it parks for a human.
-                    return UncertainOutcome(code="partial_result")
+                    return UncertainOutcome(code="partial_result",
+                                            confirmed_message_ids=confirmed)
+                if any(type(mid) is not int or mid <= 0 for mid in ids) or len(set(ids)) != len(ids):
+                    return UncertainOutcome(code="partial_result",
+                                            confirmed_message_ids=confirmed)
                 return self._sent_group(returned)
             case unknown:  # unreachable through domain validation
                 raise AssertionError(f"unhandled content kind {unknown!r}")
@@ -302,6 +311,39 @@ class AiogramChannelTransport(ChannelTransport):
         if not copied:
             return UncertainOutcome(code="partial_result")
         return Sent(message_ids=(copied[0].message_id,))
+
+    async def edit_published_part(
+        self, request: NavEditRequest
+    ) -> PublishOutcome:
+        """ChannelEditor capability: re-render an ALREADY PUBLISHED channel
+        message with navigation links (the sender's post-publish pass only).
+
+        Bound to the one resolved channel destination — like publishes, this
+        can never target the owner chat. Mirrors ``publish``: never raises,
+        every failure arrives as a classified outcome; nothing here retries.
+        The edit changes formatting only: the text is the part's frozen
+        published text, supplied by the caller from the durable snapshot."""
+
+        try:
+            if request.kind == "caption":
+                message = await self._bot.edit_message_caption(
+                    chat_id=self._channel_id,
+                    message_id=request.message_id,
+                    caption=request.text,
+                    caption_entities=to_aiogram_entities(request.entities),
+                )
+            else:
+                message = await self._bot.edit_message_text(
+                    chat_id=self._channel_id,
+                    message_id=request.message_id,
+                    text=request.text,
+                    entities=to_aiogram_entities(request.entities),
+                )
+        except Exception as exc:  # same conservative taxonomy as publish
+            return self._classify(exc)
+        edited_id = getattr(message, "message_id", None) or request.message_id
+        return Sent(message_ids=(edited_id,),
+                    permalink=self._permalink(edited_id))
 
     async def notify_owner(self, text: str) -> None:
         try:

@@ -317,7 +317,7 @@ class _Harness:
         self.feed({"message": incoming})
 
     def press_text(self, label: str, *, user_id: int = OWNER) -> None:
-        if label in ("Создать пост", "Отложенное", "Черновики", "Контент-план", "Настройки", "Рестарт"):
+        if label in texts.MENU_ALIASES:
             self.message(text=label, message_id=10000 + self._update_id,
                          **{"from": {"id": user_id, "is_bot": False, "first_name": "x"}})
             return
@@ -354,9 +354,8 @@ class _Harness:
         return self.flow.navigation_store(OWNER).get(OWNER)
 
     def last_labels(self) -> list[str]:
-        markup = self.cards()[-1].get("reply_markup")
-        assert markup is not None, "last sent message has no keyboard"
-        return [b["text"] for row in markup["inline_keyboard"] for b in row]
+        markup = self.cards()[-1].get("reply_markup", {})
+        return [b["text"] for row in markup.get("inline_keyboard", []) for b in row]
 
 
 def _raw_message(**kwargs: Any) -> dict[str, Any]:
@@ -393,17 +392,17 @@ def test_confirmation_rechecks_clock_after_ack(services, purpose, answer_error, 
     h.press_text(texts.MENU_DRAFTS if old is None else texts.MENU_PLAN)
     if old is None:
         h.press_text(next(label for label in h.last_labels()
-                          if label.startswith(f"№{post} ·")))
+                          if label.startswith(f"№{post} |")))
     else:
         marker = "❌" if purpose == "replan" else "🕒"
         h.press_text(next(label for label in h.last_labels()
                           if label == f"13:00 | {marker} | hello owner"))
     h.press_text(texts.BTN_SCHEDULE if old is None else
                  texts.BTN_EDIT_TIME if purpose == "edit_time" else texts.BTN_REPLAN)
-    if old is None:
-        h.press_text(texts.BTN_OWN_TIME)
     h.message(text="12:00", message_id=40)
-    h.press_text("Продолжить")
+    assert h.last_text() == '❗ Публикация будет запланирована на 12:00 21.10.2026 ❗'
+    assert services.publications.get_by_post(post) == old
+    assert h.last_labels() == [texts.BTN_CONFIRM, "Изменить дату", texts.BTN_CANCEL]
     h.now = NOW + 3599  # 11:59:59, before the selected minute
     h.session.before_answer = lambda: setattr(h, "now", NOW + after_ack)
     h.session.answer_error = answer_error
@@ -416,27 +415,34 @@ def test_confirmation_rechecks_clock_after_ack(services, purpose, answer_error, 
         return
     assert texts.TIME_NOT_FUTURE in h.last_text()
     assert "12:00" in h.last_text() and "21.10.2026" in h.last_text()
-    assert {"Дата", "Время", "Продолжить"} <= set(h.last_labels())
+    assert h.last_labels() == ["Изменить дату", texts.BTN_BACK]
+    assert h.ui.get().state is State.MANUAL_TIME
+    assert h.ui.get().arg("time_form") == {
+        "date": "2026-10-21", "time": "12:00", "field": None}
     assert services.publications.get_by_post(post) == old
     assert (NOW + 3600) // 60 not in services.publications.reserved_minutes()
     assert services.manual_times.recent() == []
 
 
-def test_form_continue_rechecks_clock_after_ack(services):
+def test_date_selection_rechecks_clock_after_ack(services):
     h = _Harness(services)
     h.message(text="/start")
     h.press_text(texts.MENU_NEW_POST)
     h.message(text="post", message_id=40)
     h.press_text(texts.BTN_CONTINUE)
-    h.press_text(texts.BTN_SCHEDULE)
-    h.press_text(texts.BTN_OWN_TIME)
     h.message(text="12:00", message_id=41)
+    assert texts.BTN_CONFIRM in h.last_labels()
+    h.press_text("Изменить дату")
     h.now = NOW + 3599
     h.session.before_answer = lambda: setattr(h, "now", NOW + 3602)
-    h.press_text("Продолжить")
+    before = len(h.session.requests)
+    h.press_text("Сегодня")
+    assert sum(m == "answerCallbackQuery" for m, _ in h.session.requests[before:]) == 1
     assert texts.TIME_NOT_FUTURE in h.last_text()
     assert "12:00" in h.last_text()
     assert texts.BTN_CONFIRM not in h.last_labels()
+    assert "Продолжить" not in h.last_labels()
+    assert services.publications.get_by_post(h.ui.get().arg("post_id")) is None
     assert services.publications.reserved_minutes() == set()
 
 
@@ -447,8 +453,7 @@ def test_hour_selection_rechecks_clock_after_ack(services, expired):
     h.press_text(texts.MENU_NEW_POST)
     h.message(text="post", message_id=40)
     h.press_text(texts.BTN_CONTINUE)
-    h.press_text(texts.BTN_SCHEDULE)
-    h.press_text(texts.BTN_NEXT_SLOT)
+    h.press_text(texts.BTN_DAY_SLOTS)
     h.now = NOW + 3599
     h.session.before_answer = lambda: setattr(h, "now", NOW + (3602 if expired else 3599))
     h.press_text("12:00")
@@ -457,7 +462,7 @@ def test_hour_selection_rechecks_clock_after_ack(services, expired):
         assert "12:00" not in h.last_labels()
         assert texts.BTN_CONFIRM not in h.last_labels()
     else:
-        assert h.last_text().startswith(texts.CONFIRM_SUMMARY_PREFIX)
+        assert h.last_text() == '❗ Публикация будет запланирована на 12:00 21.10.2026 ❗'
         h.press_text(texts.BTN_CONFIRM)
         assert texts.SCHEDULED_PREFIX in h.last_text()
 
@@ -465,7 +470,10 @@ def test_hour_selection_rechecks_clock_after_ack(services, expired):
 def test_dispatch_start_sends_menu(services: Services) -> None:
     h = _Harness(services)
     h.feed(_private_text("/start"))
-    assert h.last_labels() == [texts.MENU_JOURNAL]
+    assert [[button["text"] for button in row]
+            for row in h.cards()[-1]["reply_markup"]["inline_keyboard"]] == [
+                ["← Пред.", "Сегодня", "След. →"], ["Создать пост"]]
+    assert texts.BTN_BACK not in h.last_labels()
     assert any(button["text"] == texts.MENU_NEW_POST
                for row in h.sent()[0]["reply_markup"]["keyboard"] for button in row)
     assert h.ui.get().state is State.MENU
@@ -478,11 +486,11 @@ def test_postponed_section_new_and_legacy_keyboard_route(services, label):
     h.message(text="/start")
     keyboard = h.sent()[0]["reply_markup"]["keyboard"]
     keys = [button["text"] for row in keyboard for button in row]
-    assert len(keys) == 5 and "Отложенное" in keys and "Черновики" not in keys
+    assert len(keys) == 6 and texts.MENU_DRAFTS in keys and "Черновики" not in keys
     h.message(text=label, message_id=50)
     assert h.last_text().startswith("Отложенное")
     assert "Чернов" not in h.last_text()
-    h.press_text(next(value for value in h.last_labels() if value.startswith(f"№{post_id} ·")))
+    h.press_text(next(value for value in h.last_labels() if value.startswith(f"№{post_id} |")))
     assert "Отложенный пост" in h.last_text() and "Чернов" not in h.last_text()
     assert services.drafts.get_content(post_id).text == "stored post"
     before = list(h.session.requests)
@@ -543,7 +551,8 @@ def test_dispatch_forged_token_stale_reply(services: Services) -> None:
 def test_dispatch_callback_from_other_user_never_executes(services: Services) -> None:
     h = _Harness(services)
     h.feed(_private_text("/start"))
-    token = h._button_data(texts.MENU_JOURNAL)
+    # A callback issued by the old main card remains valid after the UI move.
+    token = h.flow._token(h.flow.A_JOURNAL, now=NOW)
     before = len(h.sent())
     h.feed({"callback_query": {
         "id": "cbo",
@@ -566,8 +575,16 @@ def test_dispatch_callback_from_other_user_never_executes(services: Services) ->
     assert h.ui.get().payload == {"view": "journal"}
 
 
-def test_dispatch_photo_creates_draft_and_preview_only_to_owner(services: Services) -> None:
+@pytest.mark.parametrize("signed", [False, True])
+def test_dispatch_photo_creates_draft_and_preview_only_to_owner(services: Services, signed) -> None:
     h = _Harness(services)
+    if signed:
+        from poster_bot.domain.signature import SignatureConfig
+        from poster_bot.repo.plans import PlanStore
+
+        h.flow._signature = SignatureConfig(
+            "Main", "https://example.org/main", "Partner", "https://example.org/partner")
+        h.flow._plans = PlanStore(services.conn)
     h.feed(_private_text("/start"))
     h.press_text("Создать пост")
     h.message(message_id=5,
@@ -575,18 +592,36 @@ def test_dispatch_photo_creates_draft_and_preview_only_to_owner(services: Servic
                      {"file_id": "l", "file_unique_id": "ul", "width": 800, "height": 600}],
               caption="Фото-подпись")
     assert services.drafts.list_drafts() == []  # черновик создаётся по «Продолжить»
-    h.press_text("Продолжить")
+    # Signed intake renders immediately through central presentation; legacy
+    # unsigned intake first renders when Continue creates the durable draft.
+    assert [c.kind for c in h.preview.owner_previews] == (["photo"] if signed else [])
+    assert h.last_labels() == [texts.BTN_CONTINUE, texts.BTN_CANCEL]
+    if signed:
+        staged_preview = h.preview.owner_previews[0]
+        assert staged_preview.media.caption == "Фото-подпись\n\nMain | Partner"
+        assert staged_preview.media.file_id == "l"
+    h.press_text(texts.BTN_CONTINUE)
     post_ids = services.drafts.list_drafts()
     assert len(post_ids) == 1
     content = services.drafts.get_content(post_ids[0])
     assert content.kind == "photo"
     assert content.media is not None
-    assert content.media.caption == "Фото-подпись"
+    assert content.media.caption == ("Фото-подпись\n\nMain | Partner" if signed else "Фото-подпись")
     assert content.media.file_id == "l"
     # предпросмотр ушёл владельцу, и только ему
     assert [c.kind for c in h.preview.owner_previews] == ["photo"]
+    assert h.preview.owner_previews == [content]
+    if signed:
+        saved = h.flow._plans.get(post_ids[0])
+        assert [part.content for part in saved.plan.parts] == [content]
+        assert saved.logical.body == "Фото-подпись"
     assert h.preview.calls == []  # в канал ничего не публиковалось
-    assert "Предпросмотр" in h.last_text()
+    assert all(payload.get("chat_id", OWNER) == OWNER
+               for _, payload in h.session.requests)
+    assert texts.PICK_TIME in h.last_text()
+    assert texts.BTN_OWN_TIME not in h.last_labels()
+    assert texts.BTN_PREVIEW not in h.last_labels()
+    assert h.ui.get().arg("post_id") == post_ids[0]
     assert all(m != "sendPhoto" for m, _ in h.session.requests)
     assert all(len(p["text"]) <= TEXT_MAX for p in h.sent())
 

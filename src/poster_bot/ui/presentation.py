@@ -13,7 +13,6 @@ async def delete_best_effort(bot: Bot, chat_id: int, message_id: int) -> None:
 
 async def present(bot: Bot, chat_id: int, text: str, markup,
                   store: NavigationStore, *, now: int) -> None:
-    old = store.get(chat_id)
     # Editing cannot move a card below incoming content/preview, nor recreate
     # history cleared only on the owner's client. Always replace at the bottom.
     sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
@@ -22,5 +21,5 @@ async def present(bot: Bot, chat_id: int, text: str, markup,
     except Exception:
         await delete_best_effort(bot, chat_id, sent.message_id)
         raise
-    if old is not None:
-        await delete_best_effort(bot, chat_id, old)
+    # Retired identities are durably queued by store.set; the router cleans
+    # them together with previews only after the replacement is published.

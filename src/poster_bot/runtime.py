@@ -36,10 +36,17 @@ from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
 
 from .db import iso
+from .domain.content import Content
+from .domain.errors import ContentValidationError
+from .domain.normalization import PREPARABLE, prepare_legacy
+from .domain.original_forward import OriginalForwardPlan
+from .domain.signature import SignatureConfig
 from .journal import Journal
 from .repo.dispatch import DispatchService
 from .repo.inbox import InboxRepo
 from .repo.notifications import Notice, OwnerNoticeStore
+from .repo.plans import PlanStore
+from .repo.receipts import PartReceiptStore
 from .repo.runtime_state import RuntimeState
 from .repo.sender import SendResult, SenderService
 from .transport.ports import ChannelTransport, TransportCallError
@@ -129,11 +136,27 @@ class Runtime:
         journal: Journal | None = None,
         inbox: InboxRepo | None = None,
         refresh_dashboard: Callable[[int], Awaitable[None]] | None = None,
+        plans: PlanStore | None = None,
+        receipts: PartReceiptStore | None = None,
+        signature: SignatureConfig | None = None,
+        owner_user_id: int | None = None,
+        channel_id: int | None = None,
     ) -> None:
         self._dispatch = dispatch
         self._notices = notices
         self._runtime = runtime_state
-        self._sender = SenderService(dispatch, transport)
+        # gated live composition injects plans/receipts: the sender then runs
+        # the plan-driven path with the transport itself as the channel
+        # editor; without them the legacy path stays untouched. The injected
+        # signature is used by the sender ONLY to auto-prepare a legacy
+        # planless copy before its claim; persisted pairs keep the signature
+        # they embed.
+        self._sender = SenderService(
+            dispatch, transport, plans=plans, receipts=receipts,
+            editor=transport if plans is not None else None,
+            signature=signature,
+            owner_user_id=owner_user_id, channel_id=channel_id,
+        )
         self._transport = transport
         self._journal = journal
         self._inbox = inbox
@@ -144,9 +167,17 @@ class Runtime:
 
     @classmethod
     def for_app(cls, app, transport: ChannelTransport, *,
-                refresh_dashboard: Callable[[int], Awaitable[None]] | None = None) -> "Runtime":
+                refresh_dashboard: Callable[[int], Awaitable[None]] | None = None,
+                plans: PlanStore | None = None,
+                receipts: PartReceiptStore | None = None,
+                signature: SignatureConfig | None = None,
+                owner_user_id: int | None = None,
+                channel_id: int | None = None) -> "Runtime":
         """Compose the runtime around an opened App (app.py stays aiogram-free;
-        the live caller injects the adapter)."""
+        the live caller injects the adapter). Passing ``plans`` and
+        ``receipts`` activates the gated planned send path; ``signature``
+        additionally enables the due-time auto-prepare of legacy planless
+        copies on that path."""
         return cls(
             dispatch=app.dispatch,
             notices=app.notices,
@@ -155,6 +186,10 @@ class Runtime:
             journal=app.journal,
             inbox=InboxRepo(app.conn),
             refresh_dashboard=refresh_dashboard,
+            plans=plans,
+            receipts=receipts,
+            signature=signature,
+            owner_user_id=owner_user_id, channel_id=channel_id,
         )
 
     # -- polling support hooks (used by the UI stage) ----------------------
@@ -255,3 +290,105 @@ class Runtime:
             self._notices.mark_sent(notice.id, now_epoch=now_epoch)
             delivered.append(notice.id)
         return tuple(delivered), tuple(pending)
+
+
+# ---------------------------------------------------------------------------
+# offline migration readiness preflight (cutover operator check)
+# ---------------------------------------------------------------------------
+
+#: readiness codes owned by this scan (the content-level codes — 'preparable',
+#: 'forward', 'empty_post', 'content_invalid' and the planner's own — come
+#: from domain.normalization.prepare_legacy unchanged)
+READINESS_PLANNED = "planned"
+READINESS_PLAN_CORRUPT = "plan_corrupt"
+READINESS_MISSING_CONTENT = "missing_content"
+
+
+@dataclass(frozen=True)
+class ReadinessItem:
+    """One still-publishable publication: id, post, status and machine codes
+    ONLY — readiness reports never carry raw user content."""
+
+    publication_id: int
+    post_id: int
+    status: str
+    codes: tuple[str, ...]
+
+    @property
+    def preparable(self) -> bool:
+        """True when sending needs no operator action before cutover: the
+        post already has a frozen plan, or the gated sender's due-time
+        auto-prepare will freeze an identical one without touching the post."""
+        return self.codes in ((READINESS_PLANNED,), (PREPARABLE,))
+
+
+@dataclass(frozen=True)
+class MigrationReadiness:
+    items: tuple[ReadinessItem, ...]
+
+    @property
+    def blockers(self) -> tuple[ReadinessItem, ...]:
+        return tuple(item for item in self.items if not item.preparable)
+
+    @property
+    def ready_for_cutover(self) -> bool:
+        """Every scheduled/suspended publication has a locally accepted send
+        path (signed copy or explicitly bound native forward)."""
+        return not self.blockers
+
+
+def plan_migration_readiness(conn, signature: SignatureConfig, *,
+                             owner_user_id: int | None = None,
+                             channel_id: int | None = None,
+                             ) -> MigrationReadiness:
+    """READ-ONLY pre-cutover scan: for every scheduled/suspended publication
+    report whether sending is safe under the signature this deployment will
+    publish under ('preparable'/'planned') or why it needs owner review
+    ('forward', 'manual_split_required', 'plan_corrupt', ...).
+
+    Offline contract: pure SELECTs plus the deterministic planner — no writes,
+    no clock, no environment access, no network. The caller passes the
+    signature it intends to deploy (the function never reads env itself).
+    Legacy raw forwards remain blockers: only an explicit native input/plan
+    pair with independent trusted owner/resolved-channel binding is accepted.
+    This checks local snapshots, never remote source availability."""
+    if not isinstance(signature, SignatureConfig):
+        raise ValueError("plan_migration_readiness needs the SignatureConfig "
+                         "this deployment will publish under")
+    plans = PlanStore(conn)
+    rows = conn.execute(
+        "SELECT id, post_id, status FROM publications"
+        " WHERE status IN ('scheduled','suspended') ORDER BY id").fetchall()
+    items: list[ReadinessItem] = []
+    for row in rows:
+        try:
+            stored = plans.get(row["post_id"])
+            if stored is not None and isinstance(stored.plan, OriginalForwardPlan):
+                stored.plan.validate_binding(owner_user_id=owner_user_id,
+                                             channel_id=channel_id)
+        except ContentValidationError:
+            items.append(ReadinessItem(row["id"], row["post_id"],
+                                       row["status"],
+                                       (READINESS_PLAN_CORRUPT,)))
+            continue
+        if stored is not None:
+            items.append(ReadinessItem(row["id"], row["post_id"],
+                                       row["status"], (READINESS_PLANNED,)))
+            continue
+        content_row = conn.execute(
+            "SELECT content_json FROM posts WHERE id=?",
+            (row["post_id"],)).fetchone()
+        if content_row is None:
+            items.append(ReadinessItem(row["id"], row["post_id"],
+                                       row["status"],
+                                       (READINESS_MISSING_CONTENT,)))
+            continue
+        try:
+            content = Content.from_json(content_row["content_json"])
+        except ContentValidationError:
+            items.append(ReadinessItem(row["id"], row["post_id"],
+                                       row["status"], ("content_invalid",)))
+            continue
+        items.append(ReadinessItem(row["id"], row["post_id"], row["status"],
+                                   prepare_legacy(content, signature).codes))
+    return MigrationReadiness(tuple(items))

@@ -50,17 +50,19 @@ class TestSchedule:
 
 
 class TestEditPauseConfirm:
-    def test_edit_only_while_scheduled_and_pauses(self, services, scheduled):
+    def test_edit_pauses_and_repeated_save_stays_paused(self, services, scheduled):
         pub, post_id = scheduled
         edited = services.publications.edit_content(
             pub.id, pub.version, text_content("edited"), now_epoch=NOW
         )
         assert edited.status is Status.SUSPENDED
         assert services.drafts.get_content(post_id).text == "edited"
-        with pytest.raises(TransitionError):
-            services.publications.edit_content(
-                pub.id, edited.version, text_content("again"), now_epoch=NOW
-            )
+        again = services.publications.edit_content(
+            pub.id, edited.version, text_content("again"), now_epoch=NOW
+        )
+        assert again.status is Status.SUSPENDED
+        assert again.version == edited.version + 1
+        assert services.drafts.get_content(post_id).text == "again"
 
     def test_edit_stale_version_loses(self, services, scheduled):
         pub, _ = scheduled

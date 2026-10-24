@@ -10,12 +10,15 @@ import sqlite3
 
 from ..db import iso
 from ..repo.publications import immediate_tx
+from .preview_lifecycle import PreviewLifecycle
 
 
 class NavigationStore:
     def __init__(self, conn: sqlite3.Connection, owner_id: int) -> None:
         self._conn = conn
         self._key = f"navigation:{owner_id}"
+        self.owner_id = owner_id
+        self.lifecycle = PreviewLifecycle(conn, owner_id)
 
     def get(self, chat_id: int) -> int | None:
         row = self._conn.execute(
@@ -45,7 +48,13 @@ class NavigationStore:
         self._write(self._key + ":keyboard", chat_id, message_id, now=now)
 
     def _write(self, key: str, chat_id: int, message_id: int, *, now: int) -> None:
+        if chat_id != self.owner_id:
+            raise ValueError("navigation is restricted to the private owner chat")
         with immediate_tx(self._conn) as conn:
+            row = conn.execute("SELECT value FROM ui_state WHERE key=?", (key,)).fetchone()
+            old = json.loads(row["value"]) if row else None
+            old_id = old["message_id"] if old and old["chat_id"] == chat_id else None
+            self.lifecycle.replace_card(old_id, message_id, now=now)
             conn.execute(
                 "INSERT INTO ui_state(key,value,updated_at) VALUES (?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "

@@ -3,7 +3,6 @@ explicit replace/caption/forward-copy decisions and restart durability.
 Fully offline: fake transport only, channel publish must never be called."""
 from __future__ import annotations
 
-import re
 import pytest
 from conftest import NOW
 from ui_flow_helpers import build_flow, find_token, labels, press, press_label, reopen, run
@@ -11,10 +10,10 @@ from ui_flow_helpers import build_flow, find_token, labels, press, press_label, 
 import poster_bot.ui.texts as texts
 
 
-def _draft_number(reply_text: str) -> int:
-    match = re.search(r"№(\d+)", reply_text)
-    assert match, reply_text
-    return int(match.group(1))
+def _draft_number(reply) -> int:
+    # Continue now opens the time picker, whose text has no draft number.
+    assert reply.review_post_id is not None
+    return reply.review_post_id
 
 
 class TestCollectionBasics:
@@ -33,7 +32,9 @@ class TestCollectionBasics:
         created = press(flow, find_token(staged, texts.BTN_CONTINUE), now=NOW)
         assert texts.DRAFT_SAVED in created.text
         assert texts.PREVIEW_SENT in created.text
-        post_id = _draft_number(created.text)
+        assert texts.PICK_TIME in created.text
+        assert texts.BTN_SCHEDULE not in labels(created)
+        post_id = _draft_number(created)
         content = services.drafts.get_content(post_id)
         assert content.kind == "text" and content.text == "Привет, мир"
         # preview went to the OWNER path; the channel was never published to
@@ -98,7 +99,7 @@ class TestCaption:
         done = press_label(flow, ask, texts.BTN_AS_CAPTION, now=NOW)
         assert "Фото" in done.text
         created = press_label(flow, done, texts.BTN_CONTINUE, now=NOW)
-        content = services.drafts.get_content(_draft_number(created.text))
+        content = services.drafts.get_content(_draft_number(created))
         assert content.kind == "photo"
         # entities/caption are carried verbatim — nothing silently rewrites
         assert content.media.caption == " подпись "
@@ -123,7 +124,7 @@ class TestAlbum:
                                caption=None, media_group_id="g1"))
         assert "Альбом (3)" in third.text
         created = press_label(flow, third, texts.BTN_CONTINUE, now=NOW)
-        content = services.drafts.get_content(_draft_number(created.text))
+        content = services.drafts.get_content(_draft_number(created))
         assert content.kind == "album"
         assert [item.file_id for item in content.items] == ["p1", "v1", "p2"]
 
@@ -147,7 +148,7 @@ class TestAlbum:
         restarted_services, flow3, _ = reopen(services, tmp_path)
         created = press(flow3, token, now=NOW + 60)
         assert texts.DRAFT_SAVED in created.text
-        content = restarted_services.drafts.get_content(_draft_number(created.text))
+        content = restarted_services.drafts.get_content(_draft_number(created))
         assert content.kind == "album"
         assert [item.file_id for item in content.items] == ["p1", "p2"]
 
@@ -168,7 +169,7 @@ class TestAlbum:
         token = find_token(third, texts.BTN_CONTINUE)
         restarted, flow2, _ = reopen(services, tmp_path)
         created = press(flow2, token, now=NOW + 60)
-        content = restarted.drafts.get_content(_draft_number(created.text))
+        content = restarted.drafts.get_content(_draft_number(created))
         assert content.kind == "album"
         # every item keeps its own caption+entities verbatim through the
         # durable JSON roundtrip: nothing silently merges into one caption
@@ -188,7 +189,7 @@ class TestAlbum:
         assert ask.text == texts.CAPTION_ASK
         done = press_label(flow, ask, texts.BTN_AS_CAPTION, now=NOW)
         created = press_label(flow, done, texts.BTN_CONTINUE, now=NOW)
-        content = services.drafts.get_content(_draft_number(created.text))
+        content = services.drafts.get_content(_draft_number(created))
         assert content.caption == "общая подпись"
 
     def test_album_caption_button_refused_over_item_captions(self, services):
@@ -208,7 +209,7 @@ class TestAlbum:
         assert texts.BTN_KEEP in labels(refused)
         kept = press_label(flow, refused, texts.BTN_KEEP, now=NOW)
         created = press_label(flow, kept, texts.BTN_CONTINUE, now=NOW)
-        content = services.drafts.get_content(_draft_number(created.text))
+        content = services.drafts.get_content(_draft_number(created))
         assert content.caption is None
         assert [i.caption for i in content.items] == ["первая", "вторая"]
 
@@ -230,7 +231,7 @@ class TestAlbum:
         assert ask.text == texts.FORWARD_ASK
         copied = press_label(flow, ask, texts.BTN_MAKE_COPY, now=NOW)
         created = press_label(flow, copied, texts.BTN_CONTINUE, now=NOW)
-        content = services.drafts.get_content(_draft_number(created.text))
+        content = services.drafts.get_content(_draft_number(created))
         assert content.kind == "album"
         assert [i.caption for i in content.items] == ["cap1", "cap2"]
 
@@ -252,7 +253,7 @@ class TestForward:
         # explicit as-is press finalizes: draft of the forward source + preview
         created = press_label(flow, ask, texts.BTN_FORWARD_AS_IS, now=NOW)
         assert texts.DRAFT_SAVED in created.text
-        content = services.drafts.get_content(_draft_number(created.text))
+        content = services.drafts.get_content(_draft_number(created))
         assert content.kind == "forward" and content.mode == "forward"
         assert content.forward.chat_id == -100999
         assert content.forward.message_ids == (42,)

@@ -4,14 +4,33 @@ from __future__ import annotations
 from ..domain.states import Status
 
 # Main menu
-MENU_TEXT = "📅 Контент-план"
-MENU_NEW_POST = "Создать пост"
-MENU_DRAFTS = "Отложенное"
+MENU_TEXT = "📅 Контент-план 📅"
+MENU_NEW_POST = "✍️ Создать пост ✍️"
+MENU_DRAFTS = "🗂 Отложенное 🗂"
 LEGACY_MENU_DRAFTS = "Черновики"  # accept old keyboards, never render
-MENU_PLAN = "Контент-план"
-MENU_SETTINGS = "Настройки"
-MENU_RESTART = "Рестарт"
-MENU_JOURNAL = "Журнал"
+MENU_PLAN = "📅 Контент-план 📅"
+MENU_SETTINGS = "⚙️ Настройки ⚙️"
+MENU_RESTART = "🔄 Рестарт 🔄"
+MENU_JOURNAL = "📒 Журнал 📒"
+
+BOTTOM_MENU_ROWS = (
+    (MENU_NEW_POST, MENU_DRAFTS),
+    (MENU_PLAN, MENU_SETTINGS),
+    (MENU_JOURNAL, MENU_RESTART),
+)
+# Exact aliases only: old installed keyboards remain usable without treating
+# arbitrary emoji-prefixed post content or forwarded sources as commands.
+MENU_ALIASES = {
+    label: label for row in BOTTOM_MENU_ROWS for label in row
+} | {
+    "Создать пост": MENU_NEW_POST,
+    "Отложенное": MENU_DRAFTS,
+    LEGACY_MENU_DRAFTS: MENU_DRAFTS,
+    "Контент-план": MENU_PLAN,
+    "Настройки": MENU_SETTINGS,
+    "Рестарт": MENU_RESTART,
+    "Журнал": MENU_JOURNAL,
+}
 
 # Generic buttons
 BTN_CONTINUE = "Продолжить"
@@ -23,12 +42,17 @@ BTN_DELETE = "Удалить"
 BTN_REPLACE = "Заменить содержимое"
 BTN_KEEP = "Оставить текущее"
 BTN_AS_CAPTION = "Сделать подписью"
-BTN_FORWARD_AS_IS = "Опубликовать как есть"
+BTN_FORWARD_AS_IS = "Переслать как есть"
 BTN_MAKE_COPY = "Сделать редактируемую копию"
+BTN_COPY_SIGNED = "Создать копию с нашей подписью?"
 BTN_NEXT_SLOT = "Следующий свободный час"
+BTN_DAY_SLOTS = "Выбрать день"
 BTN_OWN_TIME = "Своё время"
 BTN_PAUSE = "Пауза"
-BTN_EDIT_CONTENT = "Редактировать содержимое"
+BTN_EDIT_CONTENT = "Отредактировать публикацию"
+BTN_EDIT_TEXT = "Отредактировать текст"
+BTN_EDIT_ATTACHMENT = "Отредактировать вложение"
+BTN_EDIT_ALL = "Отредактировать всё"
 BTN_EDIT_TIME = "Изменить время"
 BTN_RESUME = "Подтвердить публикацию"
 BTN_REPLAN = "Перепланировать"
@@ -63,6 +87,30 @@ FORWARD_ASK = (
     "отдельной кнопкой. Источник останется в чате: не удаляйте его до "
     "публикации, иначе пересылка не сработает."
 )
+FORWARD_PLANNED_ASK = (
+    "Выберите: переслать как есть без нашей подписи или создать копию с нашей "
+    "подписью. Пока вы не выбрали, источник сохранён — не удаляйте его."
+)
+BTN_FORWARD_RESEND = "Создать копию: прислать заново"
+FORWARD_RESEND_ASK = (
+    "Это оригинальная пересылка без обязательной подписи. Для публикации "
+    "нужна копия с подписью. Сохранены только координаты источника, поэтому "
+    "пришлите пост заново для создания копии: нажмите кнопку ниже и отправьте "
+    "весь пост. Исходный пост останется сохранён до завершения замены. "
+    "Если он уже запланирован, завершение редактирования поставит его на паузу; "
+    "время не изменится."
+)
+FORWARD_COPY_UNAVAILABLE = (
+    "Невозможно создать полную редактируемую копию этого содержимого. "
+    "Источник сохранён — не удаляйте сообщения. Пришлите полный пост заново "
+    "как текст, фото, видео или поддерживаемый альбом. Без копии с обязательной "
+    "подписью продолжить планирование нельзя."
+)
+SPLIT_SIZES_PREFIX = "Длины абзацев (в символах): "
+PLAN_BLOCKED_FALLBACK = (
+    "План публикации не построился; содержимое сохранено целиком, ничего "
+    "не опубликовано."
+)
 OVER_LIMITS_PREFIX = "Содержимое не проходит лимиты Telegram и отклонено: "
 TIME_BAD_INPUT = (
     "Нужно время: 810, 08:10, 8-10, 8.10 или 8 10 (часы 0–23, минуты 0–59)."
@@ -71,11 +119,12 @@ DATE_BAD_INPUT = "Нужна существующая дата в формате
 TIME_NOT_FUTURE = "Время публикации должно быть строго в будущем."
 NO_SLOT = "Свободных почасовых слотов в горизонте поиска нет."
 CONFIRM_SUMMARY_PREFIX = "Публикация: "
+CONFIRM_SCHEDULE_LINE = "❗ Публикация будет запланирована на {when:%H:%M %d.%m.%Y} ❗"
 CONFIRM_HINT = (
     "Проверьте: время будет перечитано и проверено (строго будущее, минута "
     "свободна) в момент подтверждения."
 )
-SCHEDULED_PREFIX = "Запланировано: "
+SCHEDULED_PREFIX = "✅ Запланировано: "
 STATE_MENU_HINT = "Отменено; текущий ввод сброшен."
 
 # Step validity / previews / drafts
@@ -128,7 +177,7 @@ PUB_DELETE_ASK = (
 PUB_RESUME_PAST = (
     "Сохранённое время уже прошло — нужна перепланировка на новую минуту."
 )
-PLAN_DAY_PREFIX = "План на "
+PLAN_DAY_PREFIX = "📅 План на "
 BTN_LINK = "Открыть пост в канале"
 
 # Settings / resolution

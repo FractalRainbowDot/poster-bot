@@ -253,11 +253,11 @@ class TestIdempotentRedoWithRealFlow:
         created = run(flow.new_post(now=NOW))
         staged = run(flow.text(now=NOW, text="replayed post"))
         created = run(_press(flow, staged, texts.BTN_CONTINUE))
-        picker = run(_press(flow, created, texts.BTN_SCHEDULE))
-        confirm = run(_press(flow, picker, texts.BTN_NEXT_SLOT))
-        confirm = run(_press(flow, confirm, "12:00"))
+        picker = created
+        confirm = run(_press(flow, picker, "12:00 → 21.10.2026 12:00"))
         token = find_token(confirm, texts.BTN_CONFIRM)
-        post_id = int(re.search(r"№(\d+)", created.text).group(1))
+        post_id = flow._ui().arg("post_id")
+        assert h.app.drafts.get_content(post_id).text == "replayed post"
 
         crashes = {"first": True}
 

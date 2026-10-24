@@ -55,7 +55,7 @@ class TestMessageDedupSurvivesRestart:
         assert "Альбом (2)" in replay.text
         created = press(flow2, token, now=NOW + 60)
         assert texts.DRAFT_SAVED in created.text
-        content = restarted.drafts.get_content(_draft_no(created.text))
+        content = restarted.drafts.get_content(flow2._ui().arg('post_id'))
         assert [i.file_id for i in content.items] == ["p1", "v1"]
         assert len(preview2.owner_previews) == 1
 
@@ -122,7 +122,9 @@ class TestReplayAfterConversationMoved:
         # conversation moved on: the replay must not rewrite or reset it
         assert UiStateRepo(services.conn).get().version == view.version
         assert UiStateRepo(services.conn).get().state == view.state
-        assert replay.text == texts.MENU_TEXT  # neutral idempotent answer
+        assert texts.PICK_TIME in replay.text
+        assert view.arg('schedule_picker')
+        assert texts.BTN_DAY_SLOTS in [b.label for row in replay.rows for b in row]
 
 
 class TestDispatcherReplay:

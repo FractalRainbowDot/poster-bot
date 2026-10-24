@@ -49,11 +49,13 @@ def test_media_sources_removed_only_after_committed_file_ids(services, kind):
     assert "reusable-file" in str(saved)
 
 
-def test_unsupported_rejected_and_out_of_flow_input_remain_with_feedback(services):
+def test_unrelated_control_input_removed_but_rejected_content_retained(services):
     h = _Harness(services)
     h.message(text="/start")
     h.message(text="not a command", message_id=30)
-    assert 30 in h.session.visible
+    assert 30 not in h.session.visible
+    assert h.flow.input_discarded(f'{OWNER}:30')
+    assert not h.flow.input_captured(f'{OWNER}:30')
     h.press_text(texts.MENU_NEW_POST)
     for mid, event in [
         (40, {"voice": {"file_id": "v", "file_unique_id": "u", "duration": 3}}),
@@ -136,44 +138,80 @@ def test_forward_source_kept_until_explicit_durable_copy(services):
 
 @pytest.mark.parametrize("kinds", [("audio", "audio"), ("photo", "video", "audio")])
 def test_incomplete_forward_copy_keeps_every_source_and_can_continue(
-    services, tmp_path, kinds
+    tmp_path, kinds
 ):
-    from ui_flow_helpers import reopen
+    import asyncio
+    from test_live_composition import live_config, make_bot, OWNER as LIVE_OWNER
+    from test_ui_forward_intake import Intake, ORIGIN
+    from test_ui_original_forward import NativeSession, labels
+    from poster_bot.live import compose_live
+    from poster_bot.repo.plans import PlanStore
+    from poster_bot.ui.state import UiStateRepo
 
-    h = _Harness(services)
-    h.message(text="/start")
-    h.press_text(texts.MENU_NEW_POST)
-    mids = tuple(range(40, 40 + len(kinds)))
-    for mid, kind in zip(mids, kinds):
-        media = {"file_id": f"file-{mid}", "file_unique_id": f"unique-{mid}"}
-        if kind in ("photo", "video"):
-            media.update(width=100, height=100)
-        if kind != "photo":
-            media["duration"] = 3
-        h.message(message_id=mid, media_group_id="forward-album",
-                  forward_origin={"type": "hidden_user", "date": NOW,
-                                  "sender_user_name": "source"},
-                  **{kind: [media] if kind == "photo" else media})
-    before = h.ui.get()
-    h.press_text(texts.BTN_MAKE_COPY)
-    assert not set(mids).intersection(deleted(h))
-    assert all(mid in h.session.visible for mid in mids)
-    assert h.ui.get() == before
-    assert "Невозможно" in h.last_text()
-    # Both choices and Continue remain available; no empty local copy replaces
-    # the source coordinates, including after reopening the durable database.
-    h._button_data(texts.BTN_MAKE_COPY)
-    h._button_data(texts.BTN_FORWARD_AS_IS)
-    token = h._button_data(texts.BTN_CONTINUE)
-    restarted, flow, preview = reopen(services, tmp_path)
-    from ui_flow_helpers import press
-    created = press(flow, token, now=NOW + 60)
-    assert texts.DRAFT_SAVED in created.text
-    saved = restarted.drafts.get_content(restarted.drafts.list_drafts()[0])
-    assert saved.kind == "forward"
-    assert saved.forward.chat_id == OWNER
-    assert saved.forward.message_ids == mids
-    assert preview.owner_previews == [saved]
+    async def scenario():
+        config = live_config(tmp_path)
+        session = NativeSession()
+        live = await compose_live(config, clock=lambda: NOW,
+                                  bot=make_bot(session), now_epoch=NOW)
+        h = Intake(live, session)
+        try:
+            await h.message(message_id=2, text=texts.MENU_NEW_POST)
+            mids = tuple(range(40, 40 + len(kinds)))
+            for mid, kind in zip(mids, kinds):
+                media = {"file_id": f"file-{mid}", "file_unique_id": f"unique-{mid}"}
+                if kind in ("photo", "video"):
+                    media.update(width=100, height=100)
+                if kind != "photo":
+                    media["duration"] = 3
+                await h.message(message_id=mid, media_group_id="forward-album",
+                                forward_origin=ORIGIN,
+                                **{kind: [media] if kind == "photo" else media})
+            before = UiStateRepo(live.app.conn).get()
+
+            async def unavailable_copy():
+                await h.press(texts.BTN_COPY_SIGNED)
+                assert UiStateRepo(live.app.conn).get() == before
+                assert "Невозможно" in h.card()['text']
+                assert all(not h.deleted(mid) for mid in mids)
+                assert not live.app.conn.execute('SELECT 1 FROM posts').fetchone()
+
+            await unavailable_copy()
+            await live.close()
+            live = await compose_live(config, clock=lambda: NOW,
+                                      bot=make_bot(session), now_epoch=NOW)
+            h = Intake(live, session)
+            assert UiStateRepo(live.app.conn).get() == before
+            assert tuple(h.staged().forward_ids) == mids
+            assert h.staged().forward_chat_id == LIVE_OWNER
+            # Retry remains possible but cannot save a truncated logical copy.
+            await unavailable_copy()
+            await h.press(texts.BTN_CONTINUE)
+            assert texts.BTN_COPY_SIGNED in labels(h)
+            assert texts.BTN_FORWARD_AS_IS in labels(h)
+            assert not live.app.conn.execute('SELECT 1 FROM posts').fetchone()
+            assert not [p for m, p in session.requests if m == 'forwardMessages']
+            # Continue alone is not native consent. Choose and fully preview it.
+            await h.press(texts.BTN_FORWARD_AS_IS)
+            assert not live.app.conn.execute('SELECT 1 FROM posts').fetchone()
+            assert [p for m, p in session.requests if m == 'forwardMessages'] == [
+                dict(chat_id=LIVE_OWNER, from_chat_id=LIVE_OWNER, message_ids=list(mids))]
+            await h.press(texts.BTN_CONTINUE)
+            assert texts.DRAFT_SAVED in h.card()['text']
+            pid = UiStateRepo(live.app.conn).get().arg('post_id')
+            saved = live.app.drafts.get_content(pid)
+            stored = PlanStore(live.app.conn).get(pid)
+            assert saved.kind == 'forward'
+            assert saved.forward.message_ids == mids
+            assert stored.plan.version == 4
+            assert stored.plan.source.message_ids == mids
+            assert stored.logical.source.message_ids == mids
+            assert live.app.conn.execute('SELECT COUNT(*) FROM posts').fetchone()[0] == 1
+            assert not live.app.conn.execute('SELECT 1 FROM publications').fetchone()
+            assert any(' → ' in label for label in labels(h))
+            assert all(not h.deleted(mid) for mid in mids)
+        finally:
+            await live.close()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("kinds", [("audio",), ("photo", "video")])
@@ -229,7 +267,7 @@ def test_complete_forward_copy_durable_before_cleanup_and_after_restart(
 
 
 @pytest.mark.parametrize("flow_kind", ["settings", "manual_time", "caption"])
-def test_successful_specific_inputs_removed_invalid_input_preserved(services, flow_kind):
+def test_inputs_cleaned_by_control_or_content_receipt_policy(services, flow_kind):
     h = _Harness(services)
     h.message(text="/start")
     if flow_kind == "settings":
@@ -251,8 +289,13 @@ def test_successful_specific_inputs_removed_invalid_input_preserved(services, fl
                                         "duration": 3})
     else:
         h.message(text=invalid, message_id=40)
-    assert 40 in h.session.visible
-    assert 40 not in deleted(h)
+    if flow_kind == 'caption':
+        assert 40 in h.session.visible and 40 not in deleted(h)
+        assert not h.flow.input_finished(f'{OWNER}:40')
+    else:
+        assert 40 not in h.session.visible and 40 in deleted(h)
+        assert h.flow.input_discarded(f'{OWNER}:40')
+        assert not h.flow.input_captured(f'{OWNER}:40')
     h.message(text=valid, message_id=41)
     assert h.ui.has_effect(f"{OWNER}:41")
     assert 41 not in h.session.visible

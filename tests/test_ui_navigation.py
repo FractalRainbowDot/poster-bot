@@ -91,7 +91,7 @@ def test_persistent_keyboard_reinstalled_on_start_and_cards_replaced(services):
     assert [[b["text"] for b in row] for row in markup["keyboard"]] == [
         [texts.MENU_NEW_POST, texts.MENU_DRAFTS],
         [texts.MENU_PLAN, texts.MENU_SETTINGS],
-        ["Рестарт"]]
+        [texts.MENU_JOURNAL, texts.MENU_RESTART]]
     card_id = h.card_id()
     h.press_text(texts.MENU_NEW_POST)
     h.press_text(texts.BTN_CANCEL)
@@ -120,7 +120,7 @@ def test_exact_menu_labels_override_content_intake(services, label, state):
 
 
 @pytest.mark.parametrize("step", ["creating", "editing", "date", "settings"])
-def test_restart_button_reuses_start_without_changing_saved_posts(services, step):
+def test_restart_button_opens_today_without_changing_saved_posts(services, step):
     from conftest import future, text_content
 
     h = _Harness(services)
@@ -137,10 +137,10 @@ def test_restart_button_reuses_start_without_changing_saved_posts(services, step
     elif step == "date":
         h.message(text=texts.MENU_DRAFTS, message_id=10)
         h.press_text(next(label for label in h.last_labels()
-                          if label.startswith(f"№{draft} ·")))
+                          if label.startswith(f"№{draft} |")))
         h.press_text(texts.BTN_SCHEDULE)
-        h.press_text(texts.BTN_OWN_TIME)
-        h.press_text("Дата")
+        h.message(text="12:30", message_id=11)
+        h.press_text("Изменить дату")
     else:
         h.message(text=texts.MENU_SETTINGS, message_id=10)
         h.press_text(texts.SET_START_LABEL)
@@ -150,15 +150,19 @@ def test_restart_button_reuses_start_without_changing_saved_posts(services, step
     assert h.preview.calls == []  # setup must never publish to the channel
     previews_before = list(h.preview.owner_previews)
     assert len(previews_before) == (1 if step == "date" else 0)
+    lifecycle = h.flow.navigation_store(OWNER).lifecycle._load()
+    preview_ids = set(lifecycle['active'] + lifecycle['candidate'])
+    preview_ids.update(int(mid) for mid in lifecycle['pending'])
     h.session.visible.clear()  # locally cleared history must be recreated
     before = len(h.session.requests)
     h.message(text="Рестарт", message_id=50)
     assert h.ui.get().state is State.MENU
-    assert h.ui.get().payload == {}
+    assert h.ui.get().payload == {"view": "day", "day": "2026-10-21", "page": 0}
     requests = h.session.requests[before:]
     sent = [p for m, p in requests if m == "sendMessage"]
-    assert len(sent) == 2  # fresh persistent keyboard, then fresh dashboard
-    assert sent[0]["reply_markup"]["keyboard"][-1] == [{"text": "Рестарт"}]
+    assert len(sent) == 2  # fresh persistent keyboard, then fresh day plan
+    assert sent[0]["reply_markup"]["keyboard"][-1] == [
+        {"text": texts.MENU_JOURNAL}, {"text": texts.MENU_RESTART}]
     assert sent[0]["reply_markup"]["is_persistent"] is True
     assert sent[1]["reply_markup"]["inline_keyboard"]
     assert all(p.get("text") != "/start" for p in sent)
@@ -169,7 +173,7 @@ def test_restart_button_reuses_start_without_changing_saved_posts(services, step
     assert len(h.session.visible) == 2
     assert list(h.session.visible)[-1] == h.card_id()
     assert {p["message_id"] for m, p in requests if m == "deleteMessage"} == {
-        old_card, old_keyboard, 50}
+        old_card, old_keyboard, 50} | preview_ids
     assert services.drafts.get_content(draft) == text_content("saved draft")
     assert services.drafts.get_content(planned) == text_content("planned post")
     assert services.drafts.list_drafts() == [draft]
@@ -300,7 +304,7 @@ def test_failed_send_preserves_only_working_card(services):
 def test_restart_recognizes_durable_card_then_replaces_and_reinstalls(services, tmp_path):
     h = _Harness(services)
     h.message(text="/start")
-    token = h._button_data(texts.MENU_JOURNAL)
+    token = h.flow._token(h.flow.A_JOURNAL, now=NOW)  # previously issued main-card button
     old = h.card_id()
     # New SQLite connection, flow and Dispatcher over the isolated database.
     fresh, _, _ = reopen(services, tmp_path)
@@ -346,7 +350,7 @@ def test_real_preview_transport_keeps_preview_separate_from_service_card(service
 def test_denied_callback_no_output_and_no_token_lookup(services, user_id, chat_id):
     h = _Harness(services)
     h.message(text="/start")
-    token = h._button_data(texts.MENU_JOURNAL)
+    token = h.flow._token(h.flow.A_JOURNAL, now=NOW)
     before = list(h.session.requests)
     callback(h, token, h.card_id(), user_id=user_id, chat_id=chat_id)
     assert h.session.requests == before
@@ -356,7 +360,7 @@ def test_denied_callback_no_output_and_no_token_lookup(services, user_id, chat_i
 def test_unknown_card_cannot_consume_token_or_edit_preview(services):
     h = _Harness(services)
     h.message(text="/start")
-    token = h._button_data(texts.MENU_JOURNAL)
+    token = h.flow._token(h.flow.A_JOURNAL, now=NOW)
     before = len(h.session.requests)
     callback(h, token, 12345)
     assert [m for m, _ in h.session.requests[before:]] == ["answerCallbackQuery"]
@@ -377,7 +381,7 @@ def test_duplicate_token_only_toasts_and_preserves_active_card(
         services, monkeypatch, expired_answer):
     h = _Harness(services)
     h.message(text="/start")
-    token = h._button_data(texts.MENU_JOURNAL)
+    token = h.flow._token(h.flow.A_JOURNAL, now=NOW)
     calls = []
     original = h.flow.journal_view
 

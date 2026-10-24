@@ -1,4 +1,4 @@
-"""Nearest twelve and background refresh: isolated DB and fake Telegram only."""
+"""Unified all-status day plan and in-place refresh: isolated DB/fake Telegram."""
 from conftest import NOW, text_content
 import pytest
 
@@ -13,6 +13,12 @@ from poster_bot.ui import texts
 from poster_bot.ui.state import State
 from ui_flow_helpers import build_flow, run, press_label
 
+DAY_HEAD = f"{texts.PLAN_DAY_PREFIX}21.10.2026 (Europe/Moscow)"
+
+
+def publication_labels(reply):
+    return [button.label for row in reply.rows for button in row if " | " in button.label]
+
 
 def planned(services, count=13):
     pubs = []
@@ -24,26 +30,25 @@ def planned(services, count=13):
     return pubs
 
 
-def test_main_shows_twelve_nearest_not_twelve_paginated_to_six(services):
+def test_start_shows_ten_day_rows_with_navigation_and_pagination(services):
     flow, _ = build_flow(services)
     pubs = planned(services)
     services.publications.pause(pubs[2].id, pubs[2].version, now_epoch=NOW)
     reply = run(flow.command_start(now=NOW))
-    assert reply.text == "📅 Контент-план"
+    assert reply.text == f"{DAY_HEAD}: 1–10 из 13."
     assert len(reply.rows) == 13
-    assert all(len(row) == 1 for row in reply.rows)
-    entries = [row[0] for row in reply.rows[:-1]]
-    assert len(entries) == 12
+    entries = [row[0] for row in reply.rows[:10]]
+    assert len(entries) == 10
     assert [entry.label for entry in entries] == [
-        f"21.10 11:{i:02d} | {'⏸' if i == 3 else '🕒'} | 📝 summary-{i:02d}"
-        for i in range(1, 13)]
+        f"11:{i:02d} | {'⏸' if i == 3 else '🕒'} | summary-{i:02d}"
+        for i in range(1, 11)]
     detail = press_label(flow, reply, "summary-01", now=NOW)
     assert f"Публикация №{pubs[0].id}" in detail.text
 
 
 def test_empty_dashboard_is_explicit(services):
     flow, _ = build_flow(services)
-    assert "Нет запланированных публикаций" in run(flow.command_start(now=NOW)).text
+    assert texts.NO_PLANS_DAY in run(flow.command_start(now=NOW)).text
 
 
 def runtime_for(h, *, hook=None):
@@ -66,7 +71,7 @@ def action_count(services):
     return services.conn.execute("SELECT COUNT(*) FROM owner_actions").fetchone()[0]
 
 
-def test_tick_commits_publish_then_edits_same_main_and_fills_thirteenth(services, monkeypatch):
+def test_tick_commits_publish_then_edits_same_day_and_keeps_published_row(services, monkeypatch):
     h = _Harness(services)
     pubs = planned(services)
     h.message(text="/start")
@@ -90,11 +95,10 @@ def test_tick_commits_publish_then_edits_same_main_and_fills_thirteenth(services
     assert len(h.sent()) == sends
     assert len(edits(h)) == 1 and edits(h)[0]["message_id"] == card
     assert h.card_id() == card and h.ui.get() == state
-    assert h.last_text() == "📅 Контент-план"
-    assert not any("summary-01" in label for label in h.last_labels())
-    assert any("summary-13" in label for label in h.last_labels())
-    assert sum(" | 🕒 | 📝 summary-" in label for label in h.last_labels()) == 12
-    assert all(len(row) == 1 for row in edits(h)[0]["reply_markup"]["inline_keyboard"])
+    assert h.last_text() == f"{DAY_HEAD}: 1–10 из 13."
+    assert "11:01 | ✅ | summary-01" in h.last_labels()
+    assert not any("summary-13" in label for label in h.last_labels())
+    assert sum(" | 🕒 | summary-" in label for label in h.last_labels()) == 9
     assert len(edits(h)[0]["reply_markup"]["inline_keyboard"]) == 13
     before = action_count(services)
     run(rt.tick(now_epoch=NOW + 61))
@@ -129,13 +133,83 @@ def test_refresh_error_retries_only_ui_without_republish_or_new_tokens(
     assert len(attempts) == 2 and attempts[0] == attempts[1]
     assert action_count(services) == count
     assert len(transport.calls) == 1
-    assert h.last_text() == "📅 Контент-план"
-    assert any("summary-13" in label for label in h.last_labels())
-    assert not any("summary-01" in label for label in h.last_labels())
+    assert h.last_text() == f"{DAY_HEAD}: 1–10 из 13."
+    assert "11:01 | ✅ | summary-01" in h.last_labels()
     assert "secret post" not in caplog.text
 
 
-@pytest.mark.parametrize("screen", ["creating", "editing", "detail", "day", "settings"])
+def test_page_two_refresh_keeps_selection_and_new_status_button_is_valid(services):
+    h = _Harness(services)
+    pubs = planned(services)
+    h.message(text="/start")
+    h.press_text("Ещё ↓ 2/2")
+    card, sends, state = h.card_id(), len(h.sent()), h.ui.get()
+    pub = pubs[10]
+    attempt = services.dispatch.claim(pub.id, pub.version, now_epoch=NOW + 660)
+    services.dispatch.mark_in_progress(attempt, now_epoch=NOW + 660)
+    services.dispatch.complete(pub.id, attempt, (1003,), "https://t.me/c/555/1003",
+                               now_epoch=NOW + 660)
+    run(h.dashboard.refresh(h.bot, now=NOW + 660))
+    assert h.card_id() == card and len(h.sent()) == sends and h.ui.get() == state
+    assert "11–13 из 13" in h.last_text()
+    assert "11:11 | ✅ | summary-11" in h.last_labels()
+    h.press_text("11:11 | ✅ | summary-11")
+    assert "Опубликован" in h.last_text() or "опубликован" in h.last_text()
+    assert h.ui.get().state is State.PUBLICATION
+    assert not h.preview.calls
+
+
+def test_refresh_addition_updates_pagination_and_removal_clamps_without_orphans(services):
+    h = _Harness(services)
+    planned(services, 10)
+    h.message(text="/start")
+    card, sends = h.card_id(), len(h.sent())
+    post = services.drafts.create(text_content("added later"), now_epoch=NOW)
+    pub = services.publications.schedule(post, Instant(NOW + 660), now_epoch=NOW)
+    run(h.dashboard.refresh(h.bot, now=NOW))
+    assert "Ещё ↓ 2/2" in h.last_labels() and "1–10 из 11" in h.last_text()
+    assert h.card_id() == card and len(h.sent()) == sends
+    h.press_text("Ещё ↓ 2/2")
+    old_token, old_card = h._button_data("11:11 | 🕒 | added later"), h.card_id()
+    services.publications.cancel_to_draft(pub.id, pub.version, now_epoch=NOW)
+    sends = len(h.sent())
+    run(h.dashboard.refresh(h.bot, now=NOW))
+    assert "1–10 из 10" in h.last_text()
+    assert len(h.sent()) == sends and h.card_id() == old_card
+    assert not any("added later" in label or "Ещё" in label or "Сверху" in label
+                   for label in h.last_labels())
+    from test_ui_navigation import callback
+    before = h.ui.get(), len(h.sent())
+    callback(h, old_token, old_card)
+    assert (h.ui.get(), len(h.sent())) == before
+    assert h.session.requests[-1][0] == 'answerCallbackQuery'
+
+
+def test_old_day_navigation_cannot_interrupt_a_new_screen(services):
+    from test_ui_navigation import callback
+    h = _Harness(services)
+    h.message(text="/start")
+    token, card = h._button_data("След. →"), h.card_id()
+    h.press_text(texts.MENU_NEW_POST)
+    state, sends = h.ui.get(), len(h.sent())
+    callback(h, token, card)
+    assert h.ui.get() == state and len(h.sent()) == sends
+    assert h.session.requests[-1][0] == 'answerCallbackQuery'
+
+
+def test_refresh_keeps_selected_day_at_midnight_but_today_uses_click_time(services):
+    h = _Harness(services)
+    planned(services, 1)
+    h.message(text="/start")
+    before, state = list(h.session.requests), h.ui.get()
+    h.now = NOW + 86400
+    run(h.dashboard.refresh(h.bot, now=h.now))
+    assert h.session.requests == before and h.ui.get() == state
+    h.press_text("Сегодня")
+    assert "22.10.2026" in h.last_text() and texts.NO_PLANS_DAY in h.last_text()
+
+
+@pytest.mark.parametrize("screen", ["creating", "editing", "detail", "drafts", "settings"])
 def test_background_never_hijacks_other_screen(services, screen):
     h = _Harness(services)
     pubs = planned(services, 1)
@@ -147,8 +221,8 @@ def test_background_never_hijacks_other_screen(services, screen):
         h.flow._go(State.EDITING, {"pub_id": pubs[0].id}, now=NOW)
     elif screen == "detail":
         h.press_text(next(label for label in h.last_labels() if "summary-" in label))
-    elif screen == "day":
-        h.press_text(texts.MENU_PLAN)
+    elif screen == "drafts":
+        h.press_text(texts.MENU_DRAFTS)
     else:
         h.press_text(texts.MENU_SETTINGS)
     before = (list(h.session.requests), h.ui.get(), h.card_id(), dict(h.session.visible))
@@ -174,7 +248,8 @@ def test_missing_dashboard_is_never_resurrected_until_start(services, missing_on
     assert len(edits(h)) == 1
     h.message(text="/start", message_id=99)
     assert h.card_id() != old
-    assert "Нет запланированных публикаций" in h.last_text()
+    assert h.last_text() == f"{DAY_HEAD}: 1–1 из 1."
+    assert "11:01 | ✅ | summary-01" in h.last_labels()
     assert h.card_id() in h.session.visible
 
 
@@ -183,16 +258,17 @@ def test_paused_never_sends_and_timezone_change_redisplays_without_moving_epoch(
     pub = planned(services, 1)[0]
     services.publications.pause(pub.id, pub.version, now_epoch=NOW)
     h.message(text="/start")
-    assert "21.10 11:01 | ⏸ | 📝 summary-01" in h.last_labels()
+    assert "11:01 | ⏸ | summary-01" in h.last_labels()
     services.settings.change(timezone="Pacific/Honolulu")
     rt, transport = runtime_for(h)
     run(rt.tick(now_epoch=NOW + 60))
-    assert "20.10 22:01 | ⏸ | 📝 summary-01" in h.last_labels()
-    assert h.last_text() == "📅 Контент-план"
+    # An explicitly selected calendar day stays selected on automatic refresh.
+    assert texts.NO_PLANS_DAY in h.last_text() and "21.10.2026" in h.last_text()
     assert not transport.calls
     assert services.publications.get(pub.id).scheduled_epoch == pub.scheduled_epoch
     h.message(text="/start")
-    assert "20.10 22:01 | ⏸ | 📝 summary-01" in h.last_labels()
+    assert "22:01 | ⏸ | summary-01" in h.last_labels()
+    assert "20.10.2026" in h.last_text()
 
 
 def test_unexpected_injected_hook_exception_cannot_escape_sender_tick(services):
@@ -209,7 +285,7 @@ def test_unexpected_injected_hook_exception_cannot_escape_sender_tick(services):
     assert len(transport.calls) == 1
 
 
-def test_query_orders_epochs_not_creation_and_excludes_processed_statuses(services):
+def test_query_orders_epochs_not_creation_and_includes_processed_statuses(services):
     flow, _ = build_flow(services)
     pubs = []
     for minutes in (20, 1, 30, 10, 40, 50):
@@ -228,8 +304,11 @@ def test_query_orders_epochs_not_creation_and_excludes_processed_statuses(servic
         elif outcome == "uncertain":
             services.dispatch.mark_uncertain(pub.id, attempt, "timeout",
                                              now_epoch=pub.scheduled_epoch)
+    run(flow.command_start(now=NOW))
     data = flow.dashboard_snapshot()
-    assert [e.publication_id for e in data.entries] == [pubs[1].id, pubs[0].id]
+    assert [e.publication_id for e in data.entries] == [pubs[i].id for i in (1, 3, 0, 2, 4, 5)]
+    assert {e.status for e in data.entries} >= {Status.PUBLISHED, Status.MISSED,
+                                              Status.UNCERTAIN, Status.SENDING}
 
 
 def test_old_dashboard_selection_rechecks_publication_version(services):
@@ -249,12 +328,13 @@ def test_summary_is_display_only_bounded_plain_and_keeps_all_navigation(services
     services.publications.schedule(post, Instant(NOW + 60), now_epoch=NOW)
     reply = run(flow.command_start(now=NOW))
     assert "\u202e" not in reply.rows[0][0].label and "…" in reply.rows[0][0].label
-    assert "📝 🔥 <b>hello</b>" in reply.rows[0][0].label
-    assert reply.text == "📅 Контент-план"
+    assert "🔥 <b>hello</b>" in reply.rows[0][0].label
+    assert reply.text == f"{DAY_HEAD}: 1–1 из 1."
     assert len(reply.text) < 4096
     assert services.drafts.get_content(post).text == original
     all_labels = [b.label for row in reply.rows for b in row]
-    assert texts.MENU_JOURNAL in all_labels
+    assert texts.MENU_JOURNAL not in all_labels
+    assert all_labels[-1] == "Создать пост" and texts.BTN_BACK not in all_labels
     assert not any(label in all_labels for label in (texts.MENU_NEW_POST,
                    texts.MENU_DRAFTS, texts.MENU_PLAN, texts.MENU_SETTINGS))
 
@@ -268,31 +348,33 @@ def test_dispatcher_dashboard_one_column_without_duplicate_persistent_menu(servi
     keys = {button["text"].casefold() for row in h.sent()[0]["reply_markup"]["keyboard"]
             for button in row}
     assert keys == {label.casefold() for label in (texts.MENU_NEW_POST, texts.MENU_DRAFTS,
-                    texts.MENU_PLAN, texts.MENU_SETTINGS, "Рестарт")}
-    rows = h.sent()[-1]["reply_markup"]["inline_keyboard"]
-    assert len(rows) == min(count, 12) + 1
-    assert all(len(row) == 1 for row in rows)
+                    texts.MENU_PLAN, texts.MENU_SETTINGS, texts.MENU_JOURNAL, texts.MENU_RESTART)}
+    rows = h.sent()[-1].get("reply_markup", {}).get("inline_keyboard", [])
+    assert len(rows) == min(count, 10) + 2 + (count > 10)
+    assert all(len(row) == 1 for row in rows[:min(count, 10)])
     assert not keys.intersection(button["text"].casefold() for row in rows for button in row)
-    assert [row[0]["text"] for row in rows[:-1]] == [
-        f"21.10 11:{i:02d} | 🕒 | 📝 summary-{i:02d}" for i in range(1, min(count, 12) + 1)]
+    assert rows[-1][0]["text"] == "Создать пост"
+    assert not any(button["text"] == texts.BTN_BACK for row in rows for button in row)
+    assert [row[0]["text"] for row in rows[:min(count, 10)]] == [
+        f"11:{i:02d} | 🕒 | summary-{i:02d}" for i in range(1, min(count, 10) + 1)]
     h.press_text(texts.MENU_JOURNAL)
     assert "Журнал" in h.last_text()
     h.press_text("Назад")
-    assert "Контент-план" in h.last_text()
+    assert DAY_HEAD in h.last_text()
 
 
-def test_dashboard_buttons_keep_dates_across_days_and_timezone_changes(services):
+def test_day_plan_does_not_leak_other_days_across_timezone_changes(services):
     flow, _ = build_flow(services)
     for i, offset in enumerate((86400 + 120, 60)):
         post = services.drafts.create(text_content(f"day-{i}"), now_epoch=NOW)
         services.publications.schedule(post, Instant(NOW + offset), now_epoch=NOW)
     first = run(flow.command_start(now=NOW))
-    assert [row[0].label for row in first.rows[:-1]] == [
-        "21.10 11:01 | 🕒 | 📝 day-1", "22.10 11:02 | 🕒 | 📝 day-0"]
+    assert publication_labels(first) == ["11:01 | 🕒 | day-1"]
     services.settings.change(timezone="Pacific/Honolulu")
     changed = flow.dashboard_reply(now=NOW, snapshot=flow.dashboard_snapshot())
-    assert [row[0].label for row in changed.rows[:-1]] == [
-        "20.10 22:01 | 🕒 | 📝 day-1", "21.10 22:02 | 🕒 | 📝 day-0"]
+    assert publication_labels(changed) == ["22:02 | 🕒 | day-0"]
+    today = run(flow.command_start(now=NOW))
+    assert publication_labels(today) == ["22:01 | 🕒 | day-1"]
 
 
 def test_neutral_menu_fallback_does_not_restore_duplicate_buttons(services):
@@ -300,7 +382,7 @@ def test_neutral_menu_fallback_does_not_restore_duplicate_buttons(services):
     flow._go(State.CREATING, {}, now=NOW)
     reply = flow._menu_reply(NOW)
     assert reply.dashboard is None
-    assert [[button.label for button in row] for row in reply.rows] == [[texts.MENU_JOURNAL]]
+    assert reply.rows == ()
 
 
 @pytest.mark.parametrize("kind", ["photo", "video", "audio", "album", "forward"])
@@ -319,9 +401,8 @@ def test_dashboard_buttons_reuse_stored_media_caption_or_kind_fallback(services,
     services.publications.schedule(post, Instant(NOW + 60), now_epoch=NOW)
     reply = run(flow.command_start(now=NOW))
     excerpt = caption if caption and kind != "forward" else texts.KIND_RU[kind]
-    icon = {"photo": "📷", "video": "🎬", "audio": "🎵", "album": "🖼", "forward": "↪️"}[kind]
-    assert reply.rows[0][0].label == f"21.10 11:01 | 🕒 | {icon} {excerpt}"
-    assert reply.text == "📅 Контент-план"
+    assert reply.rows[0][0].label == f"11:01 | 🕒 | {excerpt}"
+    assert reply.text == f"{DAY_HEAD}: 1–1 из 1."
     assert services.drafts.get_content(post) == content
 
 
@@ -361,11 +442,11 @@ def test_real_live_composition_polls_publishes_then_refreshes_existing_card(tmp_
             changes = [p for m, p in session.requests if m == "editMessageText"]
             assert len(changes) == 1 and changes[0]["message_id"] == card
             assert changes[0]["chat_id"] == LIVE_OWNER
-            assert changes[0]["text"] == "📅 Контент-план"
+            assert changes[0]["text"] == f"{DAY_HEAD}: 1–10 из 13."
             updated_labels = [row[0]["text"] for row in
                               changes[0]["reply_markup"]["inline_keyboard"]]
-            assert any("summary-13" in label for label in updated_labels)
-            assert not any("summary-01" in label for label in updated_labels)
+            assert "11:01 | ✅ | summary-01" in updated_labels
+            assert not any("summary-13" in label for label in updated_labels)
             channel_calls = [p for m, p in session.requests
                              if m == "sendMessage" and p["chat_id"] == CHANNEL]
             assert len(channel_calls) == 1

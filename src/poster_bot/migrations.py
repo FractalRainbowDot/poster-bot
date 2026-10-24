@@ -159,11 +159,75 @@ _V4 = (
        )""",
 )
 
+_V5 = (
+    # CHUNK2: the frozen logical post + publication plan snapshot, keyed by
+    # post. One row per post; replaced atomically while the composition is
+    # still editable (draft/scheduled/suspended/missed) and frozen from the
+    # moment the publication is claimed. The row NEVER lives in posts.
+    # content_json or ui_state: both are other contracts (single physical
+    # Content compatibility and volatile UI conversation state). The plan
+    # embeds its own validated SignatureConfig, so a later .env change can
+    # never mutate an already planned publication. JSON validity and plan
+    # semantics are re-validated strictly on every read (repo/plans.py).
+    """CREATE TABLE post_plans (
+           post_id INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
+           logical_json TEXT NOT NULL CHECK (logical_json LIKE '{%'),
+           plan_json TEXT NOT NULL CHECK (plan_json LIKE '{%'),
+           plan_version INTEGER NOT NULL CHECK (plan_version > 0),
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+       )""",
+    # Per-attempt part send intents, written in the SAME transaction as the
+    # claim CAS (durable intent BEFORE any channel call) and turned into
+    # receipts immediately after each transport ack. A crash between intent
+    # and receipt leaves 'pending' rows: the publication resolves as
+    # 'uncertain' via the existing recovery sweep and is never auto-retried,
+    # so a pending row next to a resolved attempt is durable evidence of the
+    # exact part whose outcome is unknown. A multi-part publication whose
+    # parts all carry receipts is completed through dispatch.complete with
+    # the union of the parts' ids and one part's canonical permalink — the
+    # published_history contract stays exactly the old one (compat read).
+    # Single-part legacy publications never get rows here.
+    """CREATE TABLE publication_parts (
+           id INTEGER PRIMARY KEY,
+           attempt_id INTEGER NOT NULL REFERENCES send_attempts(id) ON DELETE CASCADE,
+           part_index INTEGER NOT NULL CHECK (part_index >= 1),
+           part_count INTEGER NOT NULL CHECK (part_count >= 1),
+           state TEXT NOT NULL CHECK (state IN ('pending','confirmed','uncertain','failed')),
+           part_snapshot_json TEXT NOT NULL CHECK (part_snapshot_json LIKE '{%'),
+           channel_message_ids TEXT CHECK (channel_message_ids IS NULL OR channel_message_ids LIKE '[%'),
+           permalink TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           confirmed_at TEXT,
+           UNIQUE (attempt_id, part_index),
+           CHECK (part_index <= part_count),
+           CHECK (state <> 'confirmed'
+                  OR (permalink IS NOT NULL AND channel_message_ids IS NOT NULL))
+       )""",
+    # Navigation edits are NOT send attempts: they are separate durable
+    # attempts to editMessageText/caption of ALREADY RECEIVED parts, allowed
+    # only once every part of the attempt has a receipt and the publication
+    # completed. A failed edit never touches the part receipt rows (the
+    # published bodies are immutable), never re-sends, never re-claims.
+    # Target URLs are built by the sender from the configured channel and
+    # the stored receipts — never from callback data.
+    """CREATE TABLE navigation_edits (
+           id INTEGER PRIMARY KEY,
+           part_id INTEGER NOT NULL UNIQUE REFERENCES publication_parts(id) ON DELETE CASCADE,
+           state TEXT NOT NULL CHECK (state IN ('pending','confirmed','failed')),
+           last_error TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+       )""",
+)
+
 MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = (
     (1, "baseline", _V1),
     (2, "runtime_outbox", _V2),
     (3, "ui_durable", _V3),
     (4, "ui_effects", _V4),
+    (5, "composite_publication", _V5),
 )
 
 CURRENT_VERSION = MIGRATIONS[-1][0]

@@ -32,11 +32,12 @@ def test_selection_previews_once_privately_before_fresh_controls(services):
     assert requests[1][1]["entities"][0]["custom_emoji_id"] == "123"
     assert all(p.get("chat_id", OWNER) == OWNER for _, p in requests)
     assert not any(m == "editMessageText" for m, _ in requests)
-    assert texts.BTN_PREVIEW in h.last_labels()
+    assert texts.BTN_PREVIEW not in h.last_labels()
     start = len(h.session.requests)
     callback(h, token)
     assert [m for m, _ in h.session.requests[start:]] == ["answerCallbackQuery"]
-    h.press_text(texts.BTN_PREVIEW)
+    h.message(text=texts.MENU_DRAFTS)
+    h.press_text(next(label for label in h.last_labels() if f"№{pid}" in label))
     assert sum(m == "sendMessage" and p.get("text") == content.text
                for m, p in h.session.requests) == 2
     assert persistent_content(services) == before
@@ -71,9 +72,13 @@ def test_failed_auto_preview_retains_draft_and_internal_back_does_not_repeat(ser
     before = persistent_content(services)
     h.session.send_error = "Bad Request: isolated failure"
     callback(h, token)
-    assert texts.PREVIEW_FAILED_PREFIX in h.last_text()
-    assert texts.BTN_PREVIEW in h.last_labels()
+    assert "Не удалось показать весь пост" in h.last_text()
+    assert "Повторить предпросмотр" in h.last_labels()
     assert persistent_content(services) == before
+    h.press_text("Повторить предпросмотр")
+    assert texts.BTN_PREVIEW not in h.last_labels()
+    assert sum(m == "sendMessage" and p.get("text") == "draft body"
+               for m, p in h.session.requests) == 2  # failed attempt + retry
     start = len(h.session.requests)
     h.press_text(texts.BTN_DELETE)
     h.press_text(texts.BTN_BACK)

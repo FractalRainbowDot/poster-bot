@@ -1,11 +1,56 @@
 """Pure owner dashboard snapshot. No state transitions or callback issuance."""
 from dataclasses import dataclass
+from datetime import date
 import unicodedata
 from zoneinfo import ZoneInfo
 
 from ..domain.content import Content
 from ..domain.states import Status
 from . import texts
+
+
+#: kind -> media icon, shared by plan rows and the deferred list rows
+KIND_ICONS = {"text": "📝", "photo": "📷", "video": "🎬", "audio": "🎵",
+              "album": "🖼", "forward": "↪️"}
+
+
+def icon_for(kind: str) -> str:
+    return KIND_ICONS.get(kind, "📝")
+
+
+@dataclass(frozen=True)
+class DayEntry:
+    publication_id: int
+    version: int
+    when: str
+    summary: str
+    status: Status
+    kind: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.when} | {texts.status_marker(self.status)} | {self.summary}"
+
+
+@dataclass(frozen=True)
+class DayFrame:
+    """Selected calendar day/page, including processed publications."""
+
+    day: date
+    timezone: str
+    page: int
+    pages: int
+    start: int
+    end: int
+    total: int
+    entries: tuple[DayEntry, ...]
+
+    @property
+    def text(self) -> str:
+        body = (f"{self.start + 1}–{self.end} из {self.total}"
+                if self.total else texts.NO_PLANS_DAY)
+        return (f"{texts.PLAN_DAY_PREFIX}{self.day.strftime('%d.%m.%Y')} "
+                f"({self.timezone}): {body.rstrip('.')}.")
 
 
 @dataclass(frozen=True)
@@ -19,9 +64,7 @@ class PlannedEntry:
 
     @property
     def decorated_summary(self) -> str:
-        icon = {"text": "📝", "photo": "📷", "video": "🎬", "audio": "🎵",
-                "album": "🖼", "forward": "↪️"}.get(self.kind, "📝")
-        return f"{icon} {self.summary}"
+        return f"{icon_for(self.kind)} {self.summary}"
 
     @property
     def label(self) -> str:

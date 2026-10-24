@@ -16,10 +16,14 @@ from ..db import iso, utc_now
 from ..domain.content import Content
 from ..domain.errors import (
     ConflictError,
+    ContentValidationError,
     MinuteTakenError,
     PastTimeError,
     PublicationNotFound,
     TransitionError,
+)
+from ..domain.original_forward import (
+    FrozenPublicationPlan, PublicationInput, plan_primary_content,
 )
 from ..domain.states import CANCELABLE, Status, require_transition
 from ..domain.time import Instant
@@ -308,38 +312,91 @@ class PublicationsService:
         expected_version: int,
         new_content: Content,
         *,
+        logical: PublicationInput | None = None,
+        plan: FrozenPublicationPlan | None = None,
         now_epoch: int | None = None,
     ) -> Publication:
-        """Editing is allowed only while scheduled; it stores new content and
-        parks the publication as suspended until re-confirmation (PLAN §2)."""
-        pub = self.get(pub_id)
-        require_transition(pub.status, Status.SUSPENDED)
+        """Edit scheduled, suspended or missed content without changing its slot.
+        Scheduled publications pause until re-confirmed; suspended and missed
+        publications retain their non-sendable status, even on past slots.
+
+        CHUNK2: a planned post must replace its frozen (logical, plan) pair in
+        the SAME transaction — the two must come as a pair (half a pair would
+        desynchronise post_plans from posts.content_json), the pair is
+        pair-validated before any write, and ``new_content`` must be exactly
+        the plan's first physical part (the legacy single-Content contract).
+        A planless post keeps the plain single-content contract unchanged."""
+        if (logical is None) != (plan is None):
+            raise TransitionError(
+                "logical and plan must be replaced together as one frozen"
+                " pair; half a pair would desynchronise the snapshots")
         now = _epoch(now_epoch)
         stamp = iso(now)
         payload = new_content.to_json()  # validates before any write
+        plan_payload: tuple[str, str, int] | None = None
+        if plan is not None:
+            # late import: plans builds on this module's transaction helpers
+            from .plans import validate_plan_pair
+            validate_plan_pair(logical, plan)  # type: ignore[arg-type]
+            first = plan_primary_content(plan).to_json()
+            if first != payload:
+                raise ContentValidationError(
+                    "scheduled content must be the first physical part of the"
+                    " replacement plan (legacy readers of posts.content_json"
+                    " must see exactly what part 1 sends)")
+            plan_payload = (logical.to_json(),  # type: ignore[union-attr]
+                            plan.to_json(), plan.version)  # type: ignore[union-attr]
         with immediate_tx(self._conn) as conn:
+            # Read authoritative status/binding under the writer lock. Editing
+            # an already parked publication is not a state-machine transition.
+            pub = self.get(pub_id)
+            if pub.status not in (Status.SCHEDULED, Status.SUSPENDED, Status.MISSED):
+                raise TransitionError(
+                    "only scheduled, suspended or missed publications can be edited")
+            if pub.version != expected_version:
+                raise TransitionError("edit lost: publication was changed concurrently")
+            if plan_payload is None and conn.execute(
+                "SELECT 1 FROM post_plans WHERE post_id=?", (pub.post_id,)
+            ).fetchone() is not None:
+                raise TransitionError(
+                    "a planned publication requires a replacement logical and plan pair")
+            target_status = (Status.SUSPENDED if pub.status is Status.SCHEDULED
+                             else pub.status)
             cur = conn.execute(
                 "UPDATE posts SET content_json=?, updated_at=? WHERE id=?",
                 (payload, stamp, pub.post_id),
             )
-            assert cur.rowcount == 1
+            if cur.rowcount != 1:
+                raise PublicationNotFound(f"post {pub.post_id} not found")
             won = conn.execute(
-                "UPDATE publications SET status='suspended',"
+                "UPDATE publications SET status=?, mode=?,"
                 " version=version+1, updated_at=?"
-                " WHERE id=? AND version=? AND status='scheduled'",
-                (stamp, pub_id, expected_version),
+                " WHERE id=? AND version=? AND status=?",
+                (target_status.value, new_content.mode, stamp, pub_id, expected_version, pub.status.value),
             )
             if won.rowcount != 1:
                 raise TransitionError(
-                    "edit lost: only a scheduled publication can be edited and"
-                    " it was changed concurrently"
+                    "edit lost: publication was changed concurrently"
                 )
-        self._journal.record(
-            "edited_paused",
-            post_id=pub.post_id,
-            publication_id=pub_id,
-            now_epoch=now,
-        )
+            if plan_payload is not None:
+                conn.execute(
+                    "INSERT INTO post_plans(post_id, logical_json, plan_json,"
+                    " plan_version, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(post_id) DO UPDATE SET"
+                    " logical_json=excluded.logical_json,"
+                    " plan_json=excluded.plan_json,"
+                    " plan_version=excluded.plan_version,"
+                    " updated_at=excluded.updated_at",
+                    (pub.post_id, plan_payload[0], plan_payload[1],
+                     plan_payload[2], stamp, stamp),
+                )
+            self._journal.record(
+                "edited_paused",
+                post_id=pub.post_id,
+                publication_id=pub_id,
+                now_epoch=now,
+            )
         return self.get(pub_id)
 
     def pause(

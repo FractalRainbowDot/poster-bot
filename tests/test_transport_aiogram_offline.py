@@ -35,6 +35,7 @@ from poster_bot.transport.aiogram_channel import (
 )
 from poster_bot.transport.ports import (
     DefinitiveFailure,
+    NavEditRequest,
     Sent,
     TransportCallError,
     UncertainOutcome,
@@ -75,6 +76,12 @@ class StubBot:
 
     async def send_message(self, **kwargs):
         return self._respond("send_message", kwargs)
+
+    async def edit_message_text(self, **kwargs):
+        return self._respond("edit_message_text", kwargs)
+
+    async def edit_message_caption(self, **kwargs):
+        return self._respond("edit_message_caption", kwargs)
 
     async def send_photo(self, **kwargs):
         return self._respond("send_photo", kwargs)
@@ -158,6 +165,27 @@ class TestSingleSends:
 
 
 class TestAlbumAndForward:
+    @pytest.mark.parametrize('result,known', [
+        ([message_id(71)], (71,)),
+        ([message_id(71), message_id(72), message_id(73)], (71, 72, 73)),
+        ([message_id(71), message_id(71)], (71,)),
+        ([message_id(True), message_id(72)], (72,)),
+        ([message_id(-1), message_id('72')], ()),
+        (None, ()),
+        ({'message_id': 71}, ()),
+    ])
+    @pytest.mark.parametrize('preview', [False, True])
+    def test_partial_native_ack_retains_only_confirmed_destination_ids(self, result, known, preview):
+        bot = StubBot(result=result)
+        adapter = transport(bot)
+        content = Content(kind='forward', mode='forward', forward=ForwardSource(OWNER, (40, 41)))
+        outcome = run(adapter.send_preview(content) if preview else adapter.publish(content))
+        assert isinstance(outcome, UncertainOutcome)
+        assert outcome.code == 'partial_result'
+        assert outcome.confirmed_message_ids == known
+        assert len(bot.calls) == 1
+        assert bot.calls[0][1]['chat_id'] == (OWNER if preview else CHANNEL)
+
     def test_album_single_caption_on_first_item(self):
         bot = StubBot(result=[message(20), message(21)])
         content = Content(
@@ -210,7 +238,7 @@ class TestAlbumAndForward:
         content = Content(kind="forward", mode="forward",
                           forward=ForwardSource(chat_id=-100777, message_ids=(5, 6)))
         outcome = run(transport(bot).publish(content))
-        assert outcome == UncertainOutcome(code="partial_result")
+        assert outcome == UncertainOutcome(code="partial_result", confirmed_message_ids=(30,))
 
 
 def api_method():
@@ -465,3 +493,84 @@ class TestBuildTransportRealConfig:
         run(channel_transport.publish(text_content("post")))
         _, kwargs = bot.calls[0]
         assert kwargs["chat_id"] == CHANNEL
+
+
+def edit_request(**over) -> NavEditRequest:
+    base = dict(message_id=9002, text="часть 2", entities=(), kind="text")
+    base.update(over)
+    return NavEditRequest(**base)
+
+
+class TestNavigationEdits:
+    """ChannelEditor half of the adapter: post-publish navigation edits are
+    bound to the channel, reuse the frozen classification, never raise."""
+
+    def test_text_edit_targets_channel_never_owner(self):
+        bot = StubBot(result=message(9002))
+        outcome = run(transport(bot).edit_published_part(edit_request()))
+        assert outcome == Sent(message_ids=(9002,),
+                               permalink="https://t.me/c/1234567890/9002")
+        name, kwargs = bot.calls[0]
+        assert name == "edit_message_text"
+        assert kwargs["chat_id"] == CHANNEL
+        assert kwargs["text"] == "часть 2"
+        assert [k["chat_id"] for _n, k in bot.calls] == [CHANNEL]
+
+    def test_entities_convert_for_edit(self):
+        from poster_bot.domain.content import Entity
+
+        bot = StubBot(result=message(9002))
+        request = edit_request(entities=(
+            Entity(type="bold", offset=0, length=5),
+            Entity(type="text_link", offset=7, length=4,
+                   url="https://t.me/c/1/9"),
+        ))
+        run(transport(bot).edit_published_part(request))
+        _, kwargs = bot.calls[0]
+        assert [e.type for e in kwargs["entities"]] == ["bold", "text_link"]
+        assert kwargs["entities"][1].url == "https://t.me/c/1/9"
+
+    def test_caption_edit_uses_caption_api(self):
+        bot = StubBot(result=message(9002))
+        outcome = run(transport(bot).edit_published_part(
+            edit_request(kind="caption", text="подпись")))
+        assert isinstance(outcome, Sent)
+        name, kwargs = bot.calls[0]
+        assert name == "edit_message_caption"
+        assert kwargs["chat_id"] == CHANNEL
+        assert kwargs["caption"] == "подпись"
+        assert "text" not in kwargs
+
+    def test_api_error_is_definitive_never_raises(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        bot = StubBot(raises=TelegramBadRequest(method=api_method(),
+                                                message="message can't be edited"))
+        outcome = run(transport(bot).edit_published_part(edit_request()))
+        assert outcome == DefinitiveFailure(code="api_error")
+
+    def test_timeout_is_uncertain(self):
+        bot = StubBot(raises=TimeoutError())
+        outcome = run(transport(bot).edit_published_part(edit_request()))
+        assert outcome == UncertainOutcome(code="timeout")
+
+    def test_network_error_is_uncertain(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        bot = StubBot(raises=TelegramNetworkError(method=api_method(),
+                                                  message="connection reset"))
+        outcome = run(transport(bot).edit_published_part(edit_request()))
+        assert outcome == UncertainOutcome(code="transport_error")
+
+    def test_unexpected_error_parks_uncertain(self):
+        class Boom(Exception):
+            pass
+
+        bot = StubBot(raises=Boom())
+        outcome = run(transport(bot).edit_published_part(edit_request()))
+        assert outcome == UncertainOutcome(code="transport_error")
+
+    def test_edit_never_touches_owner_chat(self):
+        bot = StubBot(result=message(9002))
+        run(transport(bot).edit_published_part(edit_request(kind="caption")))
+        assert [k["chat_id"] for _n, k in bot.calls] == [CHANNEL]

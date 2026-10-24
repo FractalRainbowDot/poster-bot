@@ -14,6 +14,10 @@ Startup order is a reliability contract (PLAN §6):
 2. Bot API token SYNTAX check (aiogram's own validator). A malformed token
    raises ``MalformedTokenError`` naming only the env var — the value is
    never echoed — and the already-acquired lock/DB are released;
+2b. MANDATORY SIGNATURE gate (CHUNK4): without the complete signature config
+   no sender is composed at all — unsigned channel posts are impossible by
+   construction. ``validate_signature`` raises ``ConfigError`` naming the
+   four signature env vars before the bot is created or any getChat runs;
 3. channel TARGET resolution: a numeric id is used as configured (no call);
    a configured ``@channel-username`` is resolved via getChat to its stable
    numeric chat id, accepted only as a ``channel``-type chat with a negative
@@ -25,7 +29,15 @@ Startup order is a reliability contract (PLAN §6):
    carried only for building correct t.me links);
 5. the loop then polls getUpdates with the durable inbox offset, feeds
    updates through the owner router, and ticks the runtime after every
-   successful poll.
+   successful poll. Before the loop starts, a READ-ONLY migration readiness
+   preflight (``runtime.plan_migration_readiness``) logs every scheduled or
+   suspended publication that cannot be sent signed under the configured
+   signature (ids + machine codes only): auto-preparable legacy planless
+   copies are frozen and sent at their due minute; what cannot be prepared
+   (forwards, oversized paragraphs, corrupt pairs) stays fail-closed refused
+   at the channel until the owner re-composes — the poller and UI never block
+   on it, and the operator gets the full review list before the first due
+   minute.
 
 Shutdown: SIGINT/SIGTERM set the stop event; every exit path closes the bot
 session and the app (flock + DB released) and journals ``poller_stopped``.
@@ -60,6 +72,7 @@ from .config import (
     ChannelResolutionError,
     Config,
     MalformedTokenError,
+    validate_signature,
 )
 from .polling import (
     ALLOWED_UPDATES,
@@ -70,7 +83,9 @@ from .polling import (
     UpdateLike,
 )
 from .repo.inbox import InboxRepo
-from .runtime import Runtime
+from .repo.plans import PlanStore
+from .repo.receipts import PartReceiptStore
+from .runtime import Runtime, plan_migration_readiness
 from .transport.aiogram_channel import AiogramChannelTransport, create_bot
 from .ui.flow import OwnerFlow
 from .ui.handlers import create_ui_router
@@ -291,6 +306,9 @@ async def compose_live(
             validate_token(config.bot_token)
         except TokenValidationError:
             raise MalformedTokenError(ENV_TOKEN) from None
+        # mandatory signature gate BEFORE any bot/channel call: composed live
+        # machinery can never publish unsigned parts (CHUNK4)
+        validate_signature(config)
         the_bot = bot if bot is not None else create_bot(config)
         try:
             resolved = await resolve_channel(the_bot, channel_id=config.channel_id)
@@ -310,6 +328,9 @@ async def compose_live(
             owner_id=config.owner_user_id,
             channel_username=resolved.username,
         )
+        # one PlanStore for the whole graph: the flow freezes plans with the
+        # configured signature, the sender below only ever sends them back
+        plans = PlanStore(app.conn)
         flow = OwnerFlow(
             conn=app.conn,
             settings=app.settings,
@@ -321,6 +342,8 @@ async def compose_live(
             preview=transport,
             channel_id=resolved.channel_id,
             channel_username=resolved.username,
+            signature=config.signature,
+            plans=plans,
         )
         dashboard = DashboardPresentation(flow, owner_id=config.owner_user_id)
         router = create_ui_router(
@@ -332,7 +355,31 @@ async def compose_live(
         async def refresh_dashboard(now: int) -> None:
             await dashboard.refresh(the_bot, now=now)
 
-        runtime = Runtime.for_app(app, transport, refresh_dashboard=refresh_dashboard)
+        runtime = Runtime.for_app(
+            app, transport, refresh_dashboard=refresh_dashboard,
+            plans=plans, receipts=PartReceiptStore(app.conn),
+            signature=config.signature,
+            owner_user_id=config.owner_user_id, channel_id=resolved.channel_id,
+        )
+        # startup migration preflight (READ-ONLY, no channel call, no clock):
+        # the poller is NEVER blocked by legacy data — the owner UI keeps
+        # working, and auto-preparable planless copies are frozen (and then
+        # sent) at their due minute. What cannot be auto-prepared (forwards, oversized
+        # paragraphs the mandatory footer cannot fit, corrupt pairs) is a
+        # migration BLOCKER: logged here with publication ids and machine
+        # codes only — never raw content — so the operator has the complete
+        # review list BEFORE this image serves its first due minute. The
+        # sender refuses those channel-side until the owner re-composes.
+        readiness = plan_migration_readiness(
+            app.conn, config.signature, owner_user_id=config.owner_user_id,
+            channel_id=resolved.channel_id)
+        for item in readiness.blockers:
+            logger.warning(
+                "migration readiness blocker: publication=%d post=%d"
+                " status=%s codes=%s (owner review through the preview"
+                " required before the due minute)",
+                item.publication_id, item.post_id, item.status,
+                ",".join(item.codes))
         loop = PollLoop(
             source=AiogramUpdateSource(the_bot),
             handler=DispatcherUpdateHandler(dispatcher, the_bot),

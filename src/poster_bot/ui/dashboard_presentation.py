@@ -25,7 +25,7 @@ class DashboardPresentation:
         self._failures = 0
 
     def presented(self, reply) -> None:
-        """Only a successfully sent explicit main card arms background edits."""
+        """Only a successfully presented day-plan card arms background edits."""
         self._frame = reply.dashboard
         self._version = reply.dashboard_version
         self._message_id = self.navigation.get(self.owner_id) if self._frame else None

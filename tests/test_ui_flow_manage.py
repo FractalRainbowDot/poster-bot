@@ -3,12 +3,11 @@ cancel-vs-delete, published links, uncertain resolutions and immutability of
 sending/publicated state. The channel transport is never published to."""
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from conftest import NOW, future, text_content
-from ui_flow_helpers import build_flow, find_token, labels, press, press_label, run
+from ui_flow_helpers import build_flow, find_token, labels, press, press_label, run, present_reply
 
 from poster_bot.domain.states import Status
 from poster_bot.domain.time import Instant
@@ -17,8 +16,9 @@ import poster_bot.ui.texts as texts
 MOSCOW = ZoneInfo("Europe/Moscow")
 
 
-def _number(text: str) -> int:
-    return int(re.search(r"№(\d+)", text).group(1))
+def _number(reply) -> int:
+    assert reply.review_post_id is not None
+    return reply.review_post_id
 
 
 def _draft_created(flow):
@@ -29,11 +29,11 @@ def _draft_created(flow):
 
 def _scheduled(flow, services, *, post_id: int | None = None):
     created = _draft_created(flow)
-    picker = press_label(flow, created, texts.BTN_SCHEDULE, now=NOW)
-    confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=NOW)
-    confirm = press_label(flow, confirm, '12:00', now=NOW)
+    assert texts.PICK_TIME in created.text
+    confirm = press_label(flow, created, '12:00', now=NOW)
+    assert services.publications.get_by_post(_number(created)) is None
     press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
-    return services.publications.get_by_post(_number(created.text))
+    return services.publications.get_by_post(_number(created))
 
 
 def _open_pub(flow, pub_id: int, *, now: int = NOW):
@@ -44,12 +44,18 @@ def _open_pub(flow, pub_id: int, *, now: int = NOW):
 
 
 class TestPauseResume:
-    def test_pause_then_resume(self, services):
+    def test_confirmed_content_edit_pauses_then_resume(self, services):
         flow, preview = build_flow(services)
         pub = _scheduled(flow, services)
         view = _open_pub(flow, pub.id)
-        assert texts.BTN_PAUSE in labels(view)
-        paused = press_label(flow, view, texts.BTN_PAUSE, now=NOW)
+        assert texts.BTN_PAUSE not in labels(view)
+        modes = press_label(flow, view, texts.BTN_EDIT_CONTENT, now=NOW)
+        press_label(flow, modes, texts.BTN_EDIT_TEXT, now=NOW)
+        staged = run(flow.text(now=NOW, text="изменённый пост"))
+        staged = run(present_reply(flow, staged, now=NOW))
+        confirm = press_label(flow, staged, texts.BTN_CONTINUE, now=NOW)
+        assert services.publications.get(pub.id) == pub
+        paused = press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
         assert texts.STATUS_RU[Status.SUSPENDED] in paused.text
         resumed = press_label(flow, paused, texts.BTN_RESUME, now=NOW)
         assert texts.STATUS_RU[Status.SCHEDULED] in resumed.text
@@ -59,7 +65,7 @@ class TestPauseResume:
     def test_resume_of_past_time_requires_replan(self, services):
         flow, _ = build_flow(services)
         created = _draft_created(flow)
-        post_id = _number(created.text)
+        post_id = _number(created)
         pub = services.publications.schedule(post_id, future(60), now_epoch=NOW)
         services.publications.pause(pub.id, pub.version, now_epoch=NOW)
         view = _open_pub(flow, pub.id, now=NOW + 7200)  # minute has passed
@@ -69,13 +75,21 @@ class TestPauseResume:
 
 
 class TestEdits:
-    def test_content_edit_commits_on_continue_and_pauses(self, services):
+    def test_content_edit_commits_only_on_confirmation_and_pauses(self, services):
         flow, _ = build_flow(services)
         pub = _scheduled(flow, services)
         view = _open_pub(flow, pub.id)
-        press_label(flow, view, texts.BTN_EDIT_CONTENT, now=NOW)
+        original = services.drafts.get_content(pub.post_id)
+        modes = press_label(flow, view, texts.BTN_EDIT_CONTENT, now=NOW)
+        assert [texts.BTN_EDIT_TEXT, texts.BTN_EDIT_ATTACHMENT, texts.BTN_EDIT_ALL] == [
+            label for label in labels(modes) if label != texts.BTN_CANCEL]
+        press_label(flow, modes, texts.BTN_EDIT_TEXT, now=NOW)
         staged = run(flow.text(now=NOW, text="новый текст"))
-        done = press_label(flow, staged, texts.BTN_CONTINUE, now=NOW)
+        staged = run(present_reply(flow, staged, now=NOW))
+        confirm = press_label(flow, staged, texts.BTN_CONTINUE, now=NOW)
+        assert services.publications.get(pub.id) == pub
+        assert services.drafts.get_content(pub.post_id) == original
+        done = press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
         assert texts.EDIT_PAUSED_NOTE in done.text
         fresh = services.publications.get(pub.id)
         assert fresh.status is Status.SUSPENDED
@@ -88,8 +102,9 @@ class TestEdits:
         view = _open_pub(flow, pub.id)
         press_label(flow, view, texts.BTN_EDIT_TIME, now=NOW)
         confirm = run(flow.text(now=NOW, text="25.10.2026 10:00"))
-        confirm = press_label(flow, confirm, 'Продолжить', now=NOW)
-        assert confirm.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
+        assert "❗ Публикация будет запланирована на 10:00 25.10.2026 ❗" in confirm.text
+        assert texts.BTN_CONTINUE not in labels(confirm)
+        assert services.publications.get(pub.id) == pub
         done = press_label(flow, confirm, texts.BTN_CONFIRM, now=NOW)
         assert texts.TIME_EDITED in done.text
         fresh = services.publications.get(pub.id)
@@ -124,8 +139,10 @@ class TestCancelAndDelete:
     def test_draft_delete_needs_separate_confirm(self, services):
         flow, _ = build_flow(services)
         created = _draft_created(flow)
-        post_id = _number(created.text)
-        ask = press_label(flow, created, texts.BTN_DELETE, now=NOW)
+        post_id = _number(created)
+        listing = flow.drafts_view(now=NOW, page=0)
+        view = press_label(flow, listing, listing.rows[0][0].label, now=NOW)
+        ask = press_label(flow, view, texts.BTN_DELETE, now=NOW)
         assert ask.text.startswith(texts.DRAFT_DELETE_ASK)
         press_label(flow, ask, texts.BTN_YES, now=NOW)
         assert post_id not in services.drafts.list_drafts()

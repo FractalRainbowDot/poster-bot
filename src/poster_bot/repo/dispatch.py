@@ -32,9 +32,11 @@ from ..domain.errors import (
     PublicationNotFound,
     TransitionError,
 )
+from ..domain.original_forward import OriginalForwardPlan, parse_publication_plan
 from ..domain.states import Status
 from ..journal import SEND_CODES, Journal
 from .publications import Publication, immediate_tx, row_to_publication
+from .plans import PlanStore
 
 UNFINISHED_ATTEMPT_STATES = ("prepared", "in_progress")
 
@@ -63,7 +65,8 @@ class DispatchService:
 
     # ---- claim ------------------------------------------------------------
     def claim(
-        self, pub_id: int, expected_version: int, *, now_epoch: int | None = None
+        self, pub_id: int, expected_version: int, *, now_epoch: int | None = None,
+        owner_user_id: int | None = None, channel_id: int | None = None,
     ) -> int:
         """Compare-and-set scheduled -> sending plus persistent pre-call
         attempt row in one transaction. Returns the attempt id.
@@ -77,6 +80,23 @@ class DispatchService:
         denial: str | None = None
         post_id: int | None = None
         with immediate_tx(self._conn) as conn:
+            # Read and validate under the writer lock, BEFORE either the CAS
+            # or intent insert. Native mode requires independently supplied
+            # live context: persisted binding is never its own authorization.
+            plan_row = conn.execute(
+                "SELECT pp.plan_json FROM publications pub JOIN post_plans pp"
+                " ON pp.post_id=pub.post_id WHERE pub.id=?", (pub_id,),
+            ).fetchone()
+            plan = (parse_publication_plan(plan_row["plan_json"])
+                    if plan_row is not None else None)
+            if isinstance(plan, OriginalForwardPlan):
+                # Validate input/plan/version and complete content projection
+                # under the same writer lock, not just the plan discriminator.
+                native_row = conn.execute("SELECT post_id FROM publications WHERE id=?",
+                                          (pub_id,)).fetchone()
+                PlanStore(conn).get(native_row["post_id"])
+                plan.validate_binding(owner_user_id=owner_user_id,
+                                      channel_id=channel_id)
             won = conn.execute(
                 "UPDATE publications SET status='sending', version=version+1,"
                 " updated_at=? WHERE id=? AND version=? AND status='scheduled'"
@@ -96,6 +116,30 @@ class DispatchService:
                     (pub_id, stamp),
                 )
                 attempt_id = int(cur.lastrowid)
+                # CHUNK2: a PLANNED publication snapshots one durable send
+                # intent per part HERE, inside the claim transaction — the
+                # intent exists before any channel call ever starts. The plan
+                # is strictly re-parsed: a tampered snapshot raises
+                # ContentValidationError and the whole claim rolls back (no
+                # half-claimed publication, no attempt row survives). Legacy
+                # planless posts invent no rows and keep the old flow.
+                if plan is not None:
+                    if isinstance(plan, OriginalForwardPlan):
+                        intents = [(1, 1, plan.to_json())]
+                    else:
+                        intents = [
+                            (part.index, len(plan.parts), json.dumps(
+                                part.to_json(), ensure_ascii=False,
+                                sort_keys=True)) for part in plan.parts
+                        ]
+                    for index, count, snapshot in intents:
+                        conn.execute(
+                            "INSERT INTO publication_parts(attempt_id,"
+                            " part_index, part_count, state,"
+                            " part_snapshot_json, created_at, updated_at)"
+                            " VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+                            (attempt_id, index, count, snapshot, stamp, stamp),
+                        )
         if denial is not None:
             # recorded outside the rolled-back transaction
             self._journal.record(
@@ -196,6 +240,36 @@ class DispatchService:
                     f"attempt {attempt_id} is not an unfinished attempt of"
                     f" publication {pub_id}"
                 )
+            # CHUNK2: for planned publications the durable part receipts are
+            # the provenance of the history row: completion refuses while any
+            # part lacks its receipt, refuses ids that do not match the
+            # recorded union and refuses a permalink no part actually
+            # received. The published_history contract itself is unchanged
+            # (union of ids + one canonical permalink) for legacy readers.
+            part_rows = conn.execute(
+                "SELECT state, channel_message_ids, permalink FROM"
+                " publication_parts WHERE attempt_id=?", (attempt_id,)
+            ).fetchall()
+            if part_rows:
+                unreceived = [r["state"] for r in part_rows
+                              if r["state"] != "confirmed"]
+                if unreceived:
+                    raise TransitionError(
+                        "every part of the attempt must carry a confirmed"
+                        " receipt before the publication completes as"
+                        " published")
+                stored_ids = sorted(
+                    mid for r in part_rows
+                    for mid in json.loads(r["channel_message_ids"])
+                )
+                if stored_ids != sorted(channel_message_ids):
+                    raise TransitionError(
+                        "completion ids must match the union of the recorded"
+                        " part receipts")
+                if permalink not in {r["permalink"] for r in part_rows}:
+                    raise TransitionError(
+                        "completion permalink was not received on any part"
+                        " receipt")
             conn.execute(
                 "INSERT INTO published_history(publication_id, post_id,"
                 " channel_message_ids, permalink, published_at)"

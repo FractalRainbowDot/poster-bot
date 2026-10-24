@@ -19,6 +19,19 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from ..domain.content import Content, ContentValidationError, Entity
+from ..domain.planner import (
+    MANUAL_SPLIT_REQUIRED,
+    LogicalPost,
+    PlanResult,
+    plan_post,
+    PublicationPlan,
+)
+from ..domain.signature import SignatureConfig
+from ..domain.original_forward import (
+    OriginalForwardInput, OriginalForwardPlan, build_original_forward_plan,
+    FrozenPublicationPlan, PublicationInput, plan_primary_content,
+)
+from .original_forward import OriginalForwardFlow
 from ..domain.errors import (
     ConflictError,
     DomainError,
@@ -33,6 +46,7 @@ from ..domain.time import Instant, recent_manual_suggestions
 from ..journal import Journal
 from ..repo.drafts import DraftNotFound, DraftStore
 from ..repo.manual_times import ManualTimesRepo
+from ..repo.plans import PlanStore
 from ..repo.publications import Publication, PublicationsService
 from ..repo.dispatch import DispatchService
 from ..repo.settings import (
@@ -44,7 +58,8 @@ from ..repo.settings import (
 )
 from ..transport.ports import DefinitiveFailure, PublishOutcome, Sent, UncertainOutcome
 from .actions import Action, ActionStore, ActionStale
-from .replies import Button, DAY_PAGE_SIZE, MAX_ROWS, PAGE_SIZE, Reply, nav_rows, page_window
+from .replies import Button, DAY_PAGE_SIZE, JOURNAL_PAGE_SIZE, MAX_ROWS, PAGE_SIZE, Reply, nav_rows, page_window
+from .journal_presentation import event_marker
 from .state import (
     EffectAlreadyApplied,
     StaleStateError,
@@ -59,6 +74,7 @@ from .staged import (
     entities_from_json,
     entities_to_json,
 )
+from . import intake
 from .times_input import (
     day_bounds,
     format_local,
@@ -70,7 +86,12 @@ from . import texts
 from . import timezones
 from .navigation import NavigationStore
 from .scheduling import SchedulingCards, CARD_ACTIONS
-from .dashboard import Dashboard, snapshot as dashboard_snapshot, summary
+from .dashboard import (
+    DayEntry,
+    DayFrame,
+    icon_for,
+    summary,
+)
 
 PREVIEW_FAIL_RU = {
     "timeout": "таймаут канала",
@@ -111,11 +132,13 @@ class OwnerPreview(Protocol):
     async def send_preview(self, content: Content) -> PublishOutcome: ...
 
 
-class OwnerFlow(SchedulingCards):
+class OwnerFlow(OriginalForwardFlow, SchedulingCards):
     # action kinds (server-side only; callback data carries the token alone)
     A_MENU = "menu"
     A_NEW = "new_post"
     A_CONTINUE = "continue"
+    A_STAGED_PREVIEW = "staged_preview"
+    A_REVIEW_RETRY = "review_retry"
     A_REPLACE_YES = "replace_yes"
     A_REPLACE_KEEP = "replace_keep"
     A_CAPTION = "caption_set"
@@ -126,6 +149,8 @@ class OwnerFlow(SchedulingCards):
     A_DRAFT_SELECT = "draft_select"
     A_DRAFT_PREVIEW = "draft_preview"
     A_DRAFT_EDIT = "draft_edit"
+    A_EDIT_MODE = "edit_mode"
+    A_EDIT_CONFIRM = "edit_confirm"
     A_DRAFT_DELETE = "draft_delete"
     A_DRAFT_DELETE_YES = "draft_delete_yes"
     A_DRAFT_SCHEDULE = "draft_schedule"
@@ -173,6 +198,8 @@ class OwnerFlow(SchedulingCards):
         channel_username: str | None = None,
         state: UiStateRepo | None = None,
         actions: ActionStore | None = None,
+        signature: SignatureConfig | None = None,
+        plans: PlanStore | None = None,
     ) -> None:
         self._conn = conn
         self._settings = settings
@@ -191,25 +218,599 @@ class OwnerFlow(SchedulingCards):
         self._channel_username = username or None
         self._state = state or UiStateRepo(conn)
         self._actions = actions or ActionStore(conn)
+        # planned pipeline: a configured signature freezes a PublicationPlan
+        # per post; without it every legacy path below stays byte-identical.
+        if (signature is None) != (plans is None):
+            raise ValueError("planned publication needs BOTH a signature and"
+                             " a plan store")
+        self._signature = signature
+        self._plans = plans
+        self._navigation = None
 
     # ------------------------------------------------------------------ core
     def navigation_store(self, owner_id: int) -> NavigationStore:
-        return NavigationStore(self._conn, owner_id)
+        if self._navigation is None or self._navigation.owner_id != owner_id:
+            self._navigation = NavigationStore(self._conn, owner_id)
+        return self._navigation
+
+    def preview_context(self) -> bool:
+        ui = self._ui()
+        if self._planned() and ui.state is State.CREATING:
+            return not self._staged(ui).empty
+        if ui.state in (
+                State.EDITING, State.AWAIT_REPLACE,
+                State.DRAFT, State.MANUAL_TIME, State.CONFIRM_SCHEDULE):
+            return True
+        return (ui.state in (State.PUBLICATION, State.CONFIRM_SCHEDULE) or
+                (ui.state is State.DRAFT and not ui.arg("schedule_picker")
+                 and not ui.arg("hours")))
+
+    async def _send_preview(self, content: Content, *, now: int) -> PublishOutcome:
+        outcome = await self._preview.send_preview(content)
+        if isinstance(outcome, Sent) and self._navigation is not None:
+            expected = len(content.items) if content.kind == 'album' else 1
+            complete = len(outcome.message_ids) == expected
+            self._navigation.lifecycle.stage(outcome.message_ids, now=now, complete=complete)
+            if not complete:
+                return UncertainOutcome(code='partial_result')
+            self._navigation.lifecycle.bind_candidate(
+                'payload:' + hashlib.sha256(content.to_json().encode()).hexdigest(), now=now)
+        return outcome
+
+    # ------------------------------------------------------ planned pipeline
+    def _planned(self) -> bool:
+        return self._signature is not None
+
+    async def _send_preview_plan(self, plan: PublicationPlan, *,
+                                 now: int) -> PublishOutcome:
+        """Render the frozen stack EXACTLY: every part sends the text/caption
+        planned for it (published via the same Content the plan stores), in
+        plan order. All message ids of the whole stack — album items included
+        — are staged as ONE aggregate candidate, so cleanup owes every single
+        one of them. On a partial failure the ids already acknowledged stay
+        known to the lifecycle; nothing leaks out of the owner chat."""
+        if isinstance(plan, OriginalForwardPlan):
+            return await self._send_native_preview(plan, now=now)
+        ids: list[int] = []
+        version = self._ui().version
+        failure: PublishOutcome | None = None
+        for part in plan.parts:
+            outcome = await self._preview.send_preview(part.content)
+            if isinstance(outcome, Sent):
+                ids.extend(outcome.message_ids)
+                if self._navigation is not None:
+                    self._navigation.lifecycle.stage(ids, now=now, complete=False)
+                expected = (len(part.content.items)
+                            if part.content.kind == 'album' else 1)
+                if len(outcome.message_ids) != expected:
+                    # The private adapter reports every acknowledged id, but
+                    # an incomplete album is not a complete working preview.
+                    failure = UncertainOutcome(code='partial_result')
+                    break
+            if self._ui().version != version:
+                if self._navigation is not None:
+                    self._navigation.lifecycle.failed_candidate(now=now)
+                return DefinitiveFailure(code='stale_preview')
+            if not isinstance(outcome, Sent):
+                failure = outcome
+                break
+        if failure is not None:
+            return failure
+        if self._navigation is not None:
+            self._navigation.lifecycle.complete_candidate(now=now)
+        return Sent(message_ids=tuple(ids))
+
+    def _plan_blocked_reply(self, *, now: int, ui: UiState, staged: Staged,
+                            result: PlanResult,
+                            logical: LogicalPost) -> Reply:
+        """Blocking diagnostics arrive as owner-readable Russian messages.
+        Nothing is captured or replanned here: the staged input stays durable
+        exactly as received, the owner messages stay undeleted."""
+        msgs = [d.message for d in result.diagnostics]
+        if any(d.code == MANUAL_SPLIT_REQUIRED for d in result.diagnostics):
+            sizes = intake.split_paragraph_sizes(logical)
+            if sizes:
+                msgs.append(texts.SPLIT_SIZES_PREFIX
+                            + ", ".join(f"№{i} — {n}" for i, n in sizes))
+        text = "\n".join(msgs) if msgs else texts.PLAN_BLOCKED_FALLBACK
+        return Reply(text, self._staged_rows(ui, now, staged=staged), retain_input=True)
+
+    async def _text_planned(self, *, now: int, ui: UiState, staged: Staged,
+                            text: str, entities: tuple[Entity, ...],
+                            source_key: str | None) -> Reply:
+        # every chunk APPENDS until Continue — a later chunk never replaces
+        # an earlier pending one
+        intake.append_chunk(staged, text, entities)
+        intake.build_logical(staged)  # validate entities before committing intake
+        try:
+            self._state.set(ui.state, self._staged_payload(staged, ui),
+                            expected_version=ui.version, now_epoch=now,
+                            effect_key=source_key)
+        except StaleStateError:
+            # a concurrent step won the compare-and-set: the CAS transaction
+            # rolled back WITHOUT staging or capturing anything, so the
+            # incoming message stays visible and undeleted (no intake receipt).
+            # Answer from the CURRENT committed conversation — the same replay
+            # policy a redelivered update gets — never a raw exception into
+            # the update handler (PLAN §6 at-least-once).
+            return self._replay_reply(now=now)
+        return self._staged_reply(now=now, staged=staged)
+
+    async def _media_planned(self, *, now: int, ui: UiState, staged: Staged,
+                             kind: str, file_id: str, caption: str | None,
+                             caption_entities: tuple[Entity, ...],
+                             media_group_id: str | None,
+                             source_key: str | None) -> Reply:
+        result = intake.absorb_media(staged, kind, file_id, caption,
+                                     caption_entities, media_group_id)
+        if result == "overflow":
+            # the first ten stay durably staged; the extra item is NOT
+            # captured (no receipt) so its message is never deleted
+            return Reply(
+                f"Альбом вмещает {intake.ALBUM_MAX} элементов: первые "
+                f"{intake.ALBUM_MAX} сохранены в посте, этот элемент не добавлен "
+                "и опубликован не будет. Удали лишнее или собери его в отдельный пост.",
+                self._staged_rows(ui, now, staged=staged),
+            )
+        try:
+            if result == "unsupported":
+                return self._ask_replace(
+                    now=now, ui=ui, staged=staged,
+                    incoming=self._media_dict(kind, file_id, caption,
+                                              caption_entities, media_group_id),
+                    source_key=source_key,
+                )
+            intake.build_logical(staged)
+            self._state.set(ui.state, self._staged_payload(staged, ui),
+                            expected_version=ui.version, now_epoch=now,
+                            effect_key=source_key)
+        except (EffectAlreadyApplied, StaleStateError):
+            # redelivered update OR lost compare-and-set: the durable write
+            # rolled back as a whole (no staged change, no intake receipt —
+            # the message stays visible until a step actually commits), so
+            # the idempotent replay answer from the CURRENT conversation is
+            # the same established policy the legacy branch already applies.
+            return self._replay_reply(now=now)
+        return self._staged_reply(now=now, staged=staged)
+
+    async def _continue_planned(self, *, now: int, ui: UiState,
+                                staged: Staged) -> Reply:
+        if staged.kind == "forward":
+            return self._forward_choice(now=now, ui=ui, staged=staged)
+        if ui.state is State.EDITING and ui.arg('edit_mode'):
+            approved = self._approved_edit(ui)
+            if approved is None:
+                return self._edit_review_retry(ui, now=now)
+            return await self._commit_planned_edit(
+                now=now, ui=ui, logical=LogicalPost.from_json(approved['logical']),
+                plan=PublicationPlan.from_json(approved['plan']))
+        try:
+            logical = self._candidate_logical(ui, staged)
+        except ContentValidationError as exc:
+            return Reply(f"{texts.OVER_LIMITS_PREFIX}{exc}",
+                         self._staged_rows(ui, now, staged=staged))
+        result = plan_post(logical, self._signature)
+        if result.plan is None:
+            return self._plan_blocked_reply(now=now, ui=ui, staged=staged,
+                                            result=result, logical=logical)
+        plan = result.plan
+        if ui.state is State.EDITING:
+            return await self._commit_planned_edit(now=now, ui=ui,
+                                                   logical=logical, plan=plan)
+        # draft + frozen pair land in ONE immediate transaction: a crash in
+        # this window leaves no half-created post. The old two-write path
+        # could strand a planless draft whose content was the signed first
+        # part — that row's body is not recoverable, so no later preview
+        # could re-normalize it (see DraftStore.create_with_plan).
+        post_id = self._drafts.create_with_plan(logical, plan, now_epoch=now)
+        self._journal.record("draft_created", post_id=post_id, now_epoch=now)
+        self._reuse_staged_review(post_id, ui.version, plan, now=now)
+        return self._draft_created_reply(now=now, post_id=post_id,
+                                         plan=plan)
+
+    def _reuse_staged_review(self, post_id, version, plan, *, now):
+        if self._navigation is not None:
+            ui = self._ui()
+            if ui.arg('edit_confirm'):
+                version = ui.arg('edit_review_version')
+            snapshot = hashlib.sha256(plan.to_json().encode()).hexdigest()
+            key = f'stored:{post_id}:' + snapshot
+            self._navigation.lifecycle.rebind_active(f'staged:{version}', key,
+                                                     snapshot=snapshot, now=now)
+
+    async def _commit_planned_edit(self, *, now: int, ui: UiState,
+                                   logical: PublicationInput,
+                                   plan: FrozenPublicationPlan) -> Reply:
+        target = ui.arg("target")
+        if ui.arg('edit_mode') and not self._edit_target_current(ui):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
+        first = (plan_primary_content(plan) if isinstance(plan, OriginalForwardPlan)
+                 else plan.parts[0].content)
+        try:
+            if target == "draft":
+                post_id = int(ui.arg("post_id"))
+                if not isinstance(ui.arg('edit_snapshot'), str):
+                    raise TransitionError('draft review is missing; reopen the edit')
+                self._plans.save_with_content(post_id, logical, plan, first,
+                                              now_epoch=now,
+                                              expected_snapshot=ui.arg('edit_snapshot'))
+                self._journal.record("draft_updated", post_id=post_id,
+                                     now_epoch=now)
+                self._reuse_staged_review(post_id, ui.version, plan, now=now)
+                return self._draft_view(now=now, post_id=post_id, note=texts.CONTENT_UPDATED)
+            pub_id = int(ui.arg("pub_id"))
+            expected_version = int(ui.arg("expected_version"))
+            self._publications.edit_content(pub_id, expected_version, first,
+                                            logical=logical, plan=plan,
+                                            now_epoch=now)
+        except (DraftNotFound, DomainError, ContentValidationError) as exc:
+            if ui.arg('edit_mode'):
+                # Failed business CAS/storage validation is not permission to
+                # discard the durable replacement or replace the last preview.
+                return Reply(f'{texts.OP_FAILED_PREFIX}{exc}',
+                             self._staged_rows(ui, now, staged=self._staged(ui)))
+            self._go(State.MENU, {}, now=now)
+            return Reply(f"{texts.OP_FAILED_PREFIX}{exc}",
+                         self._menu_reply(now).rows)
+        self._reuse_staged_review(self._publications.get(pub_id).post_id,
+                                 ui.version, plan, now=now)
+        return self._publication_view(now=now, pub_id=pub_id, note=texts.EDIT_PAUSED_NOTE)
+
+    def _preview_note(self, outcome: PublishOutcome) -> str:
+        if isinstance(outcome, Sent):
+            return texts.PREVIEW_SENT
+        code = getattr(outcome, "code", "api_error")
+        reason = PREVIEW_FAIL_RU.get(code, code)
+        return (f"{texts.PREVIEW_FAILED_PREFIX}{reason}. "
+                f"{texts.PREVIEW_RETRY_HINT}")
+
+    def _copy_btn_label(self) -> str:
+        return texts.BTN_COPY_SIGNED if self._planned() else texts.BTN_MAKE_COPY
+
+    def _forward_choice(self, *, now: int, ui: UiState, staged: Staged) -> Reply:
+        if ui.arg('native_plan'):
+            return self._native_review_reply(now=now, retry=not (
+                self._navigation and self._navigation.lifecycle.approved_review(
+                    f'staged:{ui.version}')))
+        rows = []
+        if ui.state is not State.EDITING or (self._planned() and ui.arg('edit_mode') in ('all', 'native')):
+            rows.append((self._btn(texts.BTN_FORWARD_AS_IS,
+                                   self.A_FORWARD_AS_IS, now=now,
+                                   expected_version=ui.version),))
+        if ui.arg('edit_mode') != 'native':
+            rows.append((self._btn(self._copy_btn_label(), self.A_FORWARD_COPY,
+                                   now=now, expected_version=(ui.version
+                                       if self._planned() or ui.state is State.EDITING else None)),))
+        rows.extend(self._staged_rows(ui, now, staged=staged))
+        prompt = (texts.FORWARD_PLANNED_ASK if self._planned() else
+                  'Чтобы использовать пересланное содержимое при редактировании, '
+                  'создайте редактируемую копию отдельной кнопкой. '
+                  'До согласия источник сохранён.' if ui.state is State.EDITING else
+                  texts.FORWARD_ASK)
+        return Reply(prompt, tuple(rows[:MAX_ROWS]))
+
+    def _needs_forward_copy(self, post_id: int) -> bool:
+        return (self._planned()
+                and self._drafts.get_content(post_id).kind == "forward"
+                and self._plans.get(post_id) is None)
+
+    def _saved_forward_copy_reply(self, *, now: int, post_id: int) -> Reply:
+        # Saved raw forwards contain coordinates ONLY, not editable payload.
+        # Do not fabricate a copy or alter the post/publication on this screen.
+        pub = self._publications.get_by_post(post_id)
+        if pub is None:
+            self._go(State.DRAFT, {"post_id": post_id}, now=now)
+            edit = self._btn(texts.BTN_FORWARD_RESEND, self.A_DRAFT_EDIT,
+                             now=now, post_id=post_id)
+        else:
+            self._go(State.PUBLICATION, {"pub_id": pub.id}, now=now)
+            edit = self._btn(texts.BTN_FORWARD_RESEND, self.A_PUB_EDIT_CONTENT,
+                             now=now, publication_id=pub.id,
+                             expected_version=pub.version)
+        return Reply(texts.FORWARD_RESEND_ASK, (
+            (edit,), (self._btn(texts.BTN_BACK, self.A_BACK, now=now),)))
+
+    def _publication_copy_guard(self, *, now: int, pub_id: int) -> Reply | None:
+        if not self._planned():
+            return None
+        try:
+            pub = self._publications.get(pub_id)
+            if self._needs_forward_copy(pub.post_id):
+                return self._saved_forward_copy_reply(now=now, post_id=pub.post_id)
+            if not self._stored_plan_ready(pub.post_id):
+                return self._publication_view(now=now, pub_id=pub_id,
+                    note='Не удалось прочитать сохранённый план. Измените содержимое поста.')
+        except (DomainError, DraftNotFound):
+            pass  # the caller retains its existing missing-publication handling
+        return None
+
+    def _stored_plan_ready(self, post_id: int) -> bool:
+        if not self._planned():
+            return True
+        try:
+            return self._plans.get(post_id) is not None
+        except (DomainError, ValueError, TypeError):
+            return False
+
+    async def _planned_draft_preview(self, *, now: int, post_id: int) -> Reply:
+        """Presentation uses only the existing frozen pair, never normalization."""
+        return self._draft_view(now=now, post_id=post_id)
+
+    async def _planned_pub_preview(self, *, now: int, pub_id: int) -> Reply:
+        return self._publication_view(now=now, pub_id=pub_id)
 
     def input_captured(self, source_key: str) -> bool:
         """A durable intake receipt, not merely a successful UI response."""
         return self._state.has_effect(source_key)
 
+    def input_discarded(self, source_key: str) -> bool:
+        """Rejected control input, explicitly NOT a content-intake receipt."""
+        return self._state.has_effect(f'discarded:{source_key}')
+
+    def input_finished(self, source_key: str) -> bool:
+        return self.input_captured(source_key) or self.input_discarded(source_key)
+
+    def discard_input(self, source_key: str, *, now: int) -> None:
+        """Only the adapter's classified, delivered control rejections call this."""
+        self._state.record_effect(f'discarded:{source_key}', now_epoch=now)
+
+    def discard_rejected_forward(self, *, chat_id: int, message_id: int,
+                                 now: int) -> bool:
+        """Terminal adapter validation only, AFTER guidance was delivered.
+
+        A receipt is not proof a forward is disposable. Refuse cleanup if an
+        older staged/pending or persisted forward still needs these exact
+        coordinates (including legacy posts without intake receipts). Unknown
+        stored shapes fail closed. The router serializes owner operations.
+        """
+        key = f"{chat_id}:{message_id}"
+        if self.input_captured(key):
+            return False
+
+        if self.forward_source_referenced(chat_id=chat_id, message_id=message_id):
+            return False
+        self.discard_input(key, now=now)
+        return self.input_discarded(key)
+
+    def forward_source_referenced(self, *, chat_id: int, message_id: int) -> bool:
+        """Protect every staged and saved source, including receipt-less legacy posts.
+
+        Unreadable saved content is not evidence of an unreferenced source.
+        Owner operations are serialized by the router.
+        """
+        def referenced(value):
+            if isinstance(value, str) and value.startswith('{'):
+                try:
+                    return referenced(json.loads(value))
+                except (ValueError, RecursionError):
+                    return True
+            if isinstance(value, dict):
+                source = value.get('source')
+                if (value.get('mode') == 'original_forward' and isinstance(source, dict)
+                        and source.get('chat_id') == chat_id
+                        and message_id in source.get('message_ids', [])):
+                    return True
+                if (value.get("kind") == "forward"
+                        and value.get("forward_chat_id") == chat_id
+                        and message_id in value.get("forward_ids", [])):
+                    return True
+                return any(referenced(v) for v in value.values())
+            if isinstance(value, list):
+                return any(referenced(v) for v in value)
+            return False
+
+        if referenced(self._ui().payload):
+            return True
+        # Read-only compatibility check over the existing posts contract. A
+        # source needed by ANY saved post is protected, not just today's draft.
+        try:
+            if self._navigation is not None:
+                outputs = self._navigation.lifecycle._load()
+                if any(referenced(outputs.get(key)) for key in (
+                        'active_review', 'candidate_review', 'prepared_review')):
+                    return True
+            if (self._plans is not None and (chat_id, message_id) in
+                    self._plans.protected_original_forward_coordinates()):
+                return True
+            for row in self._conn.execute("SELECT content_json FROM posts"):
+                content = Content.from_json(row["content_json"])
+                source = content.forward
+                if (source is not None and source.chat_id == chat_id
+                        and message_id in source.message_ids):
+                    return True
+        except (DomainError, ValueError, TypeError, KeyError):
+            return True
+        return False
+
+    def forward_rejected_reply(self, *, now: int) -> Reply:
+        reply = self._replay_reply(now=now)
+        return Reply("Не удалось принять пересланное сообщение: неподдерживаемое "
+                     "содержимое или некорректное форматирование. "
+                     "Отправьте текст, фото или видео заново.", reply.rows)
+
+    def discarded_input_reply(self, *, now: int) -> Reply:
+        return self._replay_reply(now=now)
+
+    def discardable_context(self) -> bool:
+        return self._ui().state in (State.MENU, State.SETTINGS, State.SETTINGS_INPUT,
+                                   State.DRAFT, State.PUBLICATION, State.MANUAL_TIME,
+                                   State.CONFIRM_SCHEDULE)
+
+    async def review_reply(self, reply: Reply, *, now: int) -> tuple[Reply, bool]:
+        """Presentation only: scheduling is already committed, never retried here.
+
+        Stored snapshots are authoritative; no ambient-signature replanning.
+        A failed confirmation preview must not offer the approval button.
+        """
+        if reply.staged_preview_version is not None:
+            return await self._review_staged(reply, now=now)
+        if reply.review_post_id is None:
+            return reply, True
+        lifecycle = self._navigation.lifecycle if self._navigation else None
+        try:
+            if self._needs_forward_copy(reply.review_post_id):
+                return self._saved_forward_copy_reply(
+                    now=now, post_id=reply.review_post_id), False
+            stored = self._plans.get(reply.review_post_id) if self._planned() else None
+            content = self._drafts.get_content(reply.review_post_id)
+            snapshot = stored.plan.to_json() if stored is not None else content.to_json()
+            key = f'stored:{reply.review_post_id}:' + hashlib.sha256(snapshot.encode()).hexdigest()
+            if lifecycle is not None and lifecycle.matches(key):
+                return reply, True
+            if lifecycle is not None and lifecycle.review_failed(f'{key}:ui:{self._ui().version}'):
+                raise ValueError('explicit review retry required')
+            if (stored is None and not self._planned() and lifecycle is not None
+                    and lifecycle.candidate_matches(
+                        'payload:' + hashlib.sha256(snapshot.encode()).hexdigest())):
+                lifecycle.bind_candidate(key, now=now)
+                return reply, True
+            if stored is not None:
+                outcome = await self._send_preview_plan(stored.plan, now=now)
+            elif not self._planned():
+                outcome = await self._send_preview(
+                    self._drafts.get_content(reply.review_post_id), now=now)
+            else:
+                raise ValueError('missing frozen review plan')
+            if isinstance(outcome, Sent):
+                if lifecycle is not None:
+                    lifecycle.bind_candidate(key, now=now)
+                return reply, True
+        except Exception:
+            pass  # private transport/storage diagnostics must not leak to the owner
+        if self._navigation is not None:
+            self._navigation.lifecycle.failed_candidate(now=now)
+            self._navigation.lifecycle.set_review_failure(
+                f'stored:{reply.review_post_id}:' + self._review_content_snapshot(reply.review_post_id)
+                + f':ui:{self._ui().version}', now=now)
+        if self._ui().state is State.CONFIRM_SCHEDULE:
+            ui = self._ui()
+            local = Instant(ui.arg('minute_epoch')).local(self._settings.get().timezone)
+            self._go(State.MANUAL_TIME, {'purpose': 'schedule',
+                     'post_id': ui.arg('post_id'), 'time_form': {
+                         'date': local.date().isoformat(), 'time': local.strftime('%H:%M'),
+                         'field': None}}, now=now, expected_version=ui.version)
+            return self._time_form_view(now=now, note='Не удалось показать весь пост. '
+                                        'Нажмите «Повторить предпросмотр».'), False
+        return replace(reply, text=reply.text + '\nНе удалось показать весь пост. '
+                       'Нажмите «Повторить предпросмотр».',
+                       rows=((self._btn('Повторить предпросмотр', self.A_REVIEW_RETRY,
+                                        now=now, post_id=reply.review_post_id,
+                                        expected_version=self._ui().version,
+                                        arg=self._review_snapshot(reply.review_post_id)),),)
+                       + tuple(row for row in reply.rows
+                               if all(button.label != texts.BTN_CONFIRM for button in row))), False
+
+    def review_delivery_failed(self, reply: Reply, *, now: int) -> None:
+        """A complete stack without its controls is not an approved review."""
+        if self._navigation is not None:
+            lifecycle = self._navigation.lifecycle
+            lifecycle.failed_candidate(now=now)
+            if reply.review_post_id is not None:
+                key = (f'stored:{reply.review_post_id}:'
+                       + self._review_content_snapshot(reply.review_post_id)
+                       + f':ui:{self._ui().version}')
+                lifecycle.set_review_failure(key, now=now)
+
+    def _review_snapshot(self, post_id: int) -> str:
+        """Bind a retry to durable content, not the ambient signing settings."""
+        try:
+            stored = self._plans.get(post_id) if self._planned() else None
+            snapshot = (stored.plan.to_json() if stored is not None else
+                        self._drafts.get_content(post_id).to_json())
+            pub = self._publications.get_by_post(post_id)
+            if pub is not None:
+                snapshot += f':{pub.id}:{pub.version}:{pub.status}'
+            return hashlib.sha256(snapshot.encode()).hexdigest()
+        except (DomainError, ValueError, TypeError):
+            return 'unavailable'
+
+    def _review_content_snapshot(self, post_id: int) -> str:
+        try:
+            stored = self._plans.get(post_id) if self._planned() else None
+            snapshot = (stored.plan.to_json() if stored is not None else
+                        self._drafts.get_content(post_id).to_json())
+            return hashlib.sha256(snapshot.encode()).hexdigest()
+        except (DomainError, ValueError, TypeError):
+            return 'unavailable'
+
+    async def _review_staged(self, reply: Reply, *, now: int) -> tuple[Reply, bool]:
+        """Render a committed intake snapshot, without creating a draft/effect."""
+        ui = self._ui()
+        if ui.version != reply.staged_preview_version:
+            return replace(reply, stale_callback=True), False
+        if ui.arg('native_plan'):
+            return await self._review_native_staged(reply, now=now)
+        staged = self._staged(ui)
+        if (not self._planned() and not ui.arg('edit_mode')) or staged.empty or staged.kind == 'forward':
+            return reply, True
+        lifecycle = self._navigation.lifecycle if self._navigation else None
+        # Versions are durable causal identities, not wall-clock debounce keys.
+        key = f'staged:{ui.version}'
+        if ui.arg('edit_mode') and self._approved_edit(ui) is not None:
+            return reply, True
+        if not ui.arg('edit_mode') and lifecycle is not None and lifecycle.matches(key):
+            return reply, True
+        try:
+            review = lifecycle.prepared_review(key) if lifecycle and ui.arg('edit_mode') else None
+            if review is not None and review.get('identity') != self._edit_identity(ui):
+                review = None
+            if review is not None:
+                snapshot = review['plan' if self._planned() else 'content']
+                plan = PublicationPlan.from_json(snapshot) if self._planned() else None
+                content = Content.from_json(snapshot) if not self._planned() else None
+            elif self._planned():
+                logical = self._candidate_logical(ui, staged)
+                result = plan_post(logical, self._signature)
+                if result.plan is None:
+                    return self._plan_blocked_reply(now=now, ui=ui, staged=staged,
+                                                   result=result, logical=logical), False
+                snapshot = result.plan.to_json()
+                plan = result.plan
+            else:
+                content = self._candidate_content(ui, staged)
+                snapshot = content.to_json()
+            if ui.arg('edit_mode') and review is None:
+                review = {'identity': self._edit_identity(ui),
+                          'logical': self._candidate_logical(ui, staged).to_json(),
+                          'plan' if self._planned() else 'content': snapshot}
+                if lifecycle is not None:
+                    lifecycle.prepare_review(key, review, now=now)
+            if self._planned():
+                outcome = await self._send_preview_plan(plan, now=now)
+            else:
+                outcome = await self._send_preview(content, now=now)
+            if self._ui().version != ui.version:
+                return replace(reply, stale_callback=True), False
+            if isinstance(outcome, Sent):
+                if lifecycle is not None:
+                    lifecycle.bind_candidate(key, now=now,
+                        snapshot=hashlib.sha256(snapshot.encode()).hexdigest(), review=review)
+                return reply, True
+            if lifecycle is not None:
+                lifecycle.failed_candidate(now=now)
+        except Exception:
+            if lifecycle is not None:
+                lifecycle.failed_candidate(now=now)
+        if ui.arg('edit_mode'):
+            return self._edit_review_retry(ui, now=now), False
+        return replace(reply, text=reply.text + '\nНе удалось показать весь пост. '
+                       'Содержимое сохранено. Повторите просмотр кнопкой ниже.',
+                       rows=((self._btn('Повторить предпросмотр', self.A_STAGED_PREVIEW,
+                                        now=now),),) + reply.rows), False
+
     async def menu_navigation(self, *, label: str, now: int) -> Reply:
         """Stable reply-keyboard commands, independent of consumed tokens."""
+        label = texts.MENU_ALIASES.get(label, label)
         if label == texts.MENU_NEW_POST:
             return await self.new_post(now=now)
         if label in (texts.MENU_DRAFTS, texts.LEGACY_MENU_DRAFTS):
             return self.drafts_view(now=now, page=0)
-        if label == texts.MENU_PLAN:
+        if label in (texts.MENU_PLAN, texts.MENU_RESTART):
             return self.plan_today(now=now)
         if label == texts.MENU_SETTINGS:
             return self.settings_view(now=now)
+        if label == texts.MENU_JOURNAL:
+            return self.journal_view(now=now, page=0)
         return await self.command_start(now=now)
 
     def _ui(self) -> UiState:
@@ -224,38 +825,235 @@ class OwnerFlow(SchedulingCards):
         data = ui.arg("staged")
         return Staged.from_dict(data) if isinstance(data, dict) else Staged()
 
+    def _candidate_logical(self, ui: UiState, staged: Staged) -> LogicalPost:
+        replacement = intake.build_logical(staged)
+        mode = ui.arg('edit_mode')
+        if mode in ('text', 'attachment'):
+            original = LogicalPost.from_json(ui.arg('edit_original'))
+            if mode == 'text':
+                return LogicalPost(body=replacement.body, entities=replacement.entities,
+                                   media=original.media)
+            return LogicalPost(body=original.body, entities=original.entities,
+                               media=replacement.media)
+        return replacement
+
+    def _candidate_content(self, ui: UiState, staged: Staged) -> Content:
+        """Legacy unsigned installations still obey whole-component editing."""
+        logical = self._candidate_logical(ui, staged)
+        if not logical.media:
+            return Content(kind='text', text=logical.body, entities=logical.entities)
+        if len(logical.media) == 1:
+            item = replace(logical.media[0], caption=logical.body,
+                           caption_entities=logical.entities)
+            return Content(kind=item.kind, media=item)
+        return Content(kind='album', items=logical.media, caption=logical.body,
+                       caption_entities=logical.entities)
+
+    def _edit_content_snapshot(self, post_id: int) -> str:
+        # Edit CAS binds the complete pair and legacy projection. Preview keys
+        # remain plan-only so staged-to-stored approval rebinding is unchanged.
+        return (self._plans.content_snapshot(post_id) if self._planned() else
+                self._review_content_snapshot(post_id))
+
+    def _edit_target_current(self, ui: UiState) -> bool:
+        try:
+            post_id = ui.arg('post_id')
+            if ui.arg('target') == 'pub':
+                pub = self._publications.get(int(ui.arg('pub_id')))
+                if (pub.version != ui.arg('expected_version') or pub.status not in
+                        (Status.SCHEDULED, Status.SUSPENDED, Status.MISSED)):
+                    return False
+                post_id = pub.post_id
+            elif self._publications.get_by_post(int(post_id)) is not None:
+                return False
+            stored = self._plans.get(post_id) if self._planned() else None
+            if stored is not None and isinstance(stored.plan, OriginalForwardPlan):
+                if self._navigation is None:
+                    return False
+                stored.plan.validate_binding(owner_user_id=self._navigation.owner_id,
+                                             channel_id=self._channel_id)
+            return self._edit_content_snapshot(post_id) == ui.arg('edit_snapshot')
+        except (DomainError, ValueError, TypeError):
+            return False
+
+    def _edit_identity(self, ui: UiState) -> str:
+        """Semantic candidate plus original/target CAS, excluding confirmation UI."""
+        binding = {key: ui.arg(key) for key in (
+            'target', 'post_id', 'pub_id', 'expected_version', 'edit_mode', 'edit_snapshot')}
+        binding['logical'] = (self._native_pair(ui)[0].to_json() if ui.arg('native_plan')
+                              else self._candidate_logical(ui, self._staged(ui)).to_json())
+        return hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
+
+    def _approved_edit(self, ui: UiState) -> dict | None:
+        if self._navigation is None or not self._edit_target_current(ui):
+            return None
+        version = ui.arg('edit_review_version') if ui.arg('edit_confirm') else ui.version
+        review = self._navigation.lifecycle.approved_review(f'staged:{version}')
+        try:
+            if review is not None and review.get('identity') == self._edit_identity(ui):
+                return review
+        except (DomainError, ValueError, TypeError):
+            return None
+        return None
+
+    def _edit_review_retry(self, ui: UiState, *, now: int) -> Reply:
+        return Reply('Не удалось показать весь пост. Содержимое сохранено. '
+                     'Нажмите «Повторить предпросмотр».', (
+            (self._btn('Повторить предпросмотр', self.A_STAGED_PREVIEW, now=now),),
+            (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),)))
+
+    def _edit_mode_reply(self, *, now: int) -> Reply:
+        if self._ui().arg('edit_native'):
+            return Reply('Оригинальную пересылку нельзя редактировать. Можно явно '
+                         'заменить её копией с подписью; исходный пост сохранится '
+                          'до отдельного подтверждения изменений.', (
+                (self._btn('Заменить другой пересылкой как есть', self.A_EDIT_MODE,
+                           now=now, arg='native'),),
+                (self._btn('Заменить копией с подписью', self.A_EDIT_MODE,
+                           now=now, arg='all'),),
+                (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),)))
+        rows = [(self._btn(label, self.A_EDIT_MODE, now=now, arg=mode),)
+                for label, mode in ((texts.BTN_EDIT_TEXT, 'text'),
+                                    (texts.BTN_EDIT_ATTACHMENT, 'attachment'),
+                                    (texts.BTN_EDIT_ALL, 'all'))]
+        rows.append((self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),))
+        return Reply('Что отредактировать в публикации?', tuple(rows))
+
+    def _start_component_edit(self, *, now: int, post_id: int, payload: dict) -> Reply:
+        content = self._drafts.get_content(post_id)
+        stored = self._plans.get(post_id) if self._planned() else None
+        if stored is not None and isinstance(stored.plan, OriginalForwardPlan):
+            self._go(State.EDITING, dict(payload, staged=Staged().to_dict(),
+                edit_mode='choose', edit_native=True,
+                edit_snapshot=self._edit_content_snapshot(post_id)), now=now)
+            return self._edit_mode_reply(now=now)
+        # A raw forward has no editable local body. Preserve the established
+        # resend/copy consent recovery rather than inventing missing content.
+        if content.kind == 'forward' and stored is None:
+            self._go(State.EDITING, dict(payload, staged=Staged().to_dict(),
+                     edit_mode='all', edit_snapshot=self._edit_content_snapshot(post_id)), now=now)
+            return Reply(texts.EDIT_ASK, self._staged_rows(self._ui(), now, staged=Staged()))
+        original = stored.logical if stored is not None else intake.normalize_content(content)
+        normalized = intake.build_logical(intake.staged_from_logical(original))
+        self._go(State.EDITING, dict(payload, staged=Staged().to_dict(),
+                 edit_mode='choose', edit_original=normalized.to_json(),
+                 edit_snapshot=self._edit_content_snapshot(post_id)), now=now)
+        return self._edit_mode_reply(now=now)
+
+    def _edit_input_refusal(self, ui: UiState, *, now: int,
+                            has_text: bool, has_media: bool,
+                            is_forward: bool = False) -> Reply | None:
+        mode = ui.arg('edit_mode')
+        if mode and not self._edit_target_current(ui):
+            return Reply(texts.BUTTON_STALE, stale_callback=True, retain_input=True)
+        if mode == 'choose':
+            return replace(self._edit_mode_reply(now=now), retain_input=True,
+                           text='Сначала выберите, что отредактировать.')
+        if mode == 'native' and not is_forward:
+            return replace(self._replay_reply(now=now), retain_input=True,
+                           text='В этом режиме нужна оригинальная пересылка. '
+                                'Для копии с подписью отмените замену и явно выберите её режим.')
+        if ((mode == 'text' and has_media) or
+                (mode == 'attachment' and has_text)):
+            return Reply('В этом режиме нужен только текст без вложений.' if mode == 'text'
+                         else 'В этом режиме нужны только вложения без нового текста и подписей. '
+                         'Для изменения текста вместе с вложениями выберите «Отредактировать всё».',
+                         self._replay_reply(now=now).rows if ui.state is State.AWAIT_REPLACE
+                         else self._staged_rows(ui, now, staged=self._staged(ui)), retain_input=True)
+        return None
+
     def _staged_payload(self, staged: Staged, ui: UiState) -> dict:
         payload = dict(ui.payload)
         payload.pop("pending_replace", None)
         payload.pop("pending_caption", None)
+        payload.pop("edit_confirm", None)
+        payload.pop('edit_review_version', None)
+        payload.pop('native_input', None)
+        payload.pop('native_plan', None)
         payload["staged"] = staged.to_dict()
+        return payload
+
+    def _resolved_staged_payload(self, staged: Staged, ui: UiState,
+                                 restored_state: State) -> dict:
+        """Restore the edit destination, not the superseded decision snapshot.
+
+        Resending a saved forward is an ordinary bound edit. Its destination
+        and optimistic publication version survive either decision; source
+        coordinates/copy candidates survive only inside the chosen staged input.
+        Pending replacements, captions, prev_state and old consent/provenance
+        snapshots must not become authority for the next input.
+        """
+        payload = {"staged": staged.to_dict()}
+        if restored_state is State.EDITING:
+            for key in ("target", "post_id", "pub_id", "expected_version",
+                        "edit_mode", "edit_original", "edit_snapshot"):
+                if key in ui.payload:
+                    payload[key] = ui.payload[key]
         return payload
 
     def _token(self, action: str, *, now: int, **kw) -> str:
         return self._actions.create(action, now_epoch=now, **kw)
 
+    def _screen_back(self, label: str, *, now: int) -> Button:
+        ui = self._ui()
+        return self._btn(label, self.A_BACK, now=now,
+                         expected_version=ui.version, arg=f'state:{ui.state.value}')
+
     def _btn(self, label: str, action: str, *, now: int, **kw) -> Button:
-        if action in (self.A_SCHED_NEXT, self.A_SCHED_OWN, self.A_SCHED_RECENT):
+        if action == self.A_BACK and 'expected_version' not in kw:
+            # A form's conversation version is not a dashboard version.
+            # Bind both state and version so a late Back cannot leave a newer form.
+            kw.setdefault('arg', f'state:{self._ui().state.value}')
+            kw['expected_version'] = self._ui().version
+        if action in (self.A_SCHED_NEXT, self.A_SCHED_OWN, self.A_SCHED_RECENT,
+                      self.A_STAGED_PREVIEW, self.A_EDIT_MODE, self.A_EDIT_CONFIRM,
+                      self.A_REPLACE_YES, self.A_REPLACE_KEEP, self.A_CAPTION):
             kw.setdefault('expected_version', self._ui().version)
+        if self._ui().arg('edit_mode') and action in (self.A_CONTINUE, self.A_BACK):
+            kw.setdefault('expected_version', self._ui().version)
+        if action == self.A_DRAFT_EDIT:
+            kw.setdefault('expected_version', self._ui().version)
+        if action == self.A_PUB_EDIT_CONTENT:
+            kw.setdefault('arg', f'ui:{self._ui().version}')
         return Button(label, self._token(action, now=now, **kw))
 
     def _menu_reply(self, now: int) -> Reply:
         ui = self._ui()
-        if ui.state is not State.MENU or ui.payload:
+        if ui.state is State.MENU and not ui.payload:
+            return self.plan_today(now=now)
+        if ui.state is State.MENU and ui.arg('view') == 'day' and not ui.arg('day'):
+            # Older installations persisted only the view name.
+            return self.plan_today(now=now)
+        if ui.state is not State.MENU or ui.arg('view') != 'day':
             # Intake replay/error replies must remain neutral and must not
             # impersonate a main dashboard over a draft or an unfinished form.
             return Reply(texts.MENU_TEXT, self._menu_rows(now))
         return self.dashboard_reply(now=now, snapshot=self.dashboard_snapshot())
 
-    def dashboard_snapshot(self) -> Dashboard:
-        return dashboard_snapshot(self._publications, self._dispatch,
-                                  self._settings.get().timezone)
+    def dashboard_snapshot(self) -> DayFrame:
+        """Read-only fingerprint of the selected day, never nearest-planned."""
+        ui = self._ui()
+        day = date.fromisoformat(ui.arg('day'))
+        timezone = self._settings.get().timezone
+        start, end = day_bounds(day, timezone)
+        pubs = self._publications.scheduled_between(start, end)
+        start_i, end_i, pages = page_window(len(pubs), ui.arg('page', 0),
+                                           size=DAY_PAGE_SIZE)
+        entries = tuple(DayEntry(
+            pub.id, pub.version,
+            pub.scheduled_at.astimezone(ZoneInfo(timezone)).strftime('%H:%M'),
+            summary(content), pub.status, content.kind,
+        ) for pub in pubs[start_i:end_i]
+            for content in (self._dispatch.content_for_publication(pub.id),))
+        return DayFrame(day, timezone, start_i // DAY_PAGE_SIZE, pages,
+                        start_i, end_i, len(pubs), entries)
 
     def dashboard_current(self, version: int) -> bool:
         ui = self._ui()
-        return ui.state is State.MENU and not ui.payload and ui.version == version
+        return (ui.state is State.MENU and ui.arg('view') == 'day'
+                and ui.arg('day') is not None and ui.version == version)
 
-    def dashboard_reply(self, *, now: int, snapshot: Dashboard) -> Reply:
+    def dashboard_reply(self, *, now: int, snapshot: DayFrame) -> Reply:
         """Render without resetting the conversation; only changed frames issue tokens."""
         entries = [self._btn(
             entry.label, self.A_PUB_OPEN, now=now,
@@ -263,28 +1061,31 @@ class OwnerFlow(SchedulingCards):
             arg=f'row:{self._ui().version}',
         ) for entry in snapshot.entries]
         rows = [(entry,) for entry in entries]
-        rows.extend(self._menu_rows(now))
+        rows.extend(self._day_nav_rows(now=now, day=snapshot.day,
+                                       page=snapshot.page, pages=snapshot.pages))
         return Reply(snapshot.text, tuple(rows), dashboard=snapshot,
                      dashboard_version=self._ui().version)
 
     def _menu_rows(self, now: int) -> tuple[tuple[Button, ...], ...]:
-        # The four primary destinations live on the persistent reply keyboard.
-        # Journal has no persistent duplicate, so keep its existing callback.
-        return ((self._btn(texts.MENU_JOURNAL, self.A_JOURNAL, now=now),),)
+        # All destinations live on the persistent reply keyboard. Existing
+        # journal callback tokens still route through A_JOURNAL for old cards.
+        return ()
 
     def _explain(self, exc: DomainError) -> str:
         return str(exc)
 
     # ----------------------------------------------------------- entry events
     async def command_start(self, *, now: int) -> Reply:
-        self._go(State.MENU, {}, now=now)
-        return self._menu_reply(now)
+        return self.plan_today(now=now)
 
     def unsupported(self, *, now: int) -> Reply:
         ui = self._ui()
         if ui.state in (State.CREATING, State.EDITING, State.AWAIT_REPLACE):
             return Reply(texts.UNSUPPORTED,
                          self._staged_rows(ui, now, staged=self._staged(ui)))
+        if self.discardable_context():
+            current = self._replay_reply(now=now)
+            return replace(current, text=f'{texts.UNSUPPORTED}\n{current.text}')
         return Reply(texts.UNSUPPORTED)
 
     def service_message(self) -> None:
@@ -306,14 +1107,22 @@ class OwnerFlow(SchedulingCards):
                    entities: tuple[Entity, ...] = (),
                    source_key: str | None = None) -> Reply:
         ui = self._ui()
+        if source_key is not None and self.input_discarded(source_key):
+            return self._replay_reply(now=now)
         if source_key is not None and ui.state not in (
             State.CREATING, State.EDITING, State.AWAIT_REPLACE
-        ) and self._state.has_effect(source_key):
+        ) and self.input_finished(source_key):
             # a redelivered message must never reset or overwrite the newer
             # conversation step it lands in (PLAN §6 at-least-once)
             return self._replay_reply(now=now)
+        if (ui.state is State.CONFIRM_SCHEDULE or
+                (ui.state is State.MANUAL_TIME and
+                 ui.arg('purpose') in ('edit_time_confirm', 'replan_confirm'))):
+            ui = self._confirmation_form(ui)
         if (ui.state is State.MANUAL_TIME and ui.arg('time_form')) or (
-            ui.state is State.DRAFT and ui.arg('schedule_picker')
+            ui.state is State.DRAFT and (ui.arg('schedule_picker') or ui.arg('hours'))
+        ) or (
+            ui.state is State.CONFIRM_SCHEDULE and ui.arg('time_form')
         ):
             try:
                 if ui.state is State.DRAFT:
@@ -332,8 +1141,7 @@ class OwnerFlow(SchedulingCards):
             State.RESOLUTION: self._text_resolution,
         }.get(ui.state)
         if handler is None:
-            self._go(State.MENU, {}, now=now)
-            return self._menu_reply(now)
+            return self._replay_reply(now=now)
         if ui.state in (State.CREATING, State.EDITING, State.AWAIT_REPLACE):
             # content intake: the effect is deduplicated per incoming message
             # so a redelivered update replays idempotently instead of
@@ -356,15 +1164,27 @@ class OwnerFlow(SchedulingCards):
                     media_group_id: str | None = None,
                     source_key: str | None = None) -> Reply:
         ui = self._ui()
+        if source_key is not None and self.input_discarded(source_key):
+            return self._replay_reply(now=now)
         if source_key is not None and ui.state not in (
             State.CREATING, State.EDITING, State.AWAIT_REPLACE
-        ) and self._state.has_effect(source_key):
+        ) and self.input_finished(source_key):
             return self._replay_reply(now=now)
         if ui.state not in (State.CREATING, State.EDITING, State.AWAIT_REPLACE):
-            self._go(State.MENU, {}, now=now)
-            return self._menu_reply(now)
+            return self._replay_reply(now=now)
         try:
             staged = self._staged(ui)
+            refusal = self._edit_input_refusal(ui, now=now, has_text=bool(caption),
+                                               has_media=True)
+            if refusal is not None:
+                return refusal
+            if (self._planned() or ui.arg('edit_mode')) and staged.kind != "forward":
+                return await self._media_planned(now=now, ui=ui, staged=staged,
+                                                 kind=kind, file_id=file_id,
+                                                 caption=caption,
+                                                 caption_entities=caption_entities,
+                                                 media_group_id=media_group_id,
+                                                 source_key=source_key)
             result = staged.add_media(kind, file_id, caption, caption_entities,
                                       media_group_id)
         except ContentValidationError as exc:
@@ -393,14 +1213,34 @@ class OwnerFlow(SchedulingCards):
                         media_group_id: str | None,
                         copy_candidate: Staged,
                         source_key: str | None = None) -> Reply:
+        if source_key is not None and self.input_discarded(source_key):
+            return self._replay_reply(now=now)
         ui = self._ui()
         if source_key is not None and ui.state not in (
             State.CREATING, State.EDITING
         ) and self._state.has_effect(source_key):
             return self._replay_reply(now=now)
+        # Mode/target refusals retain the owner's source, including while a
+        # replacement decision is pending. Only generic wrong-moment forwards
+        # below are terminally discardable by the adapter.
+        if ui.state in (State.CREATING, State.EDITING, State.AWAIT_REPLACE):
+            try:
+                mode = ui.arg('edit_mode')
+                candidate = (intake.candidate_logical(copy_candidate)
+                             if mode in ('text', 'attachment') else None)
+                refusal = self._edit_input_refusal(ui, now=now,
+                    has_text=bool(candidate.body) if candidate else False,
+                    has_media=bool(candidate.media) if candidate else False,
+                    is_forward=True)
+                if refusal is not None:
+                    return replace(refusal, rejected_forward=True)
+            except ContentValidationError as exc:
+                return self.content_rejected(now=now, exc=exc)
         if ui.state not in (State.CREATING, State.EDITING):
-            self._go(State.MENU, {}, now=now)
-            return self._menu_reply(now)
+            reply = self._replay_reply(now=now)
+            return replace(reply, text="Сейчас пересланное сообщение не ожидается. "
+                           "Чтобы создать пост, выберите «Создать пост».\n" + reply.text,
+                           rejected_forward=True)
         try:
             staged = self._staged(ui)
             result = staged.add_forward(src_chat_id, src_message_id,
@@ -418,13 +1258,7 @@ class OwnerFlow(SchedulingCards):
             self._state.set(ui.state, self._staged_payload(staged, ui),
                             expected_version=ui.version, now_epoch=now,
                             effect_key=source_key)
-            rows = [
-                (self._btn(texts.BTN_FORWARD_AS_IS, self.A_FORWARD_AS_IS,
-                           now=now),),
-                (self._btn(texts.BTN_MAKE_COPY, self.A_FORWARD_COPY, now=now),),
-            ]
-            rows += list(self._staged_rows(ui, now, staged=staged))
-            return Reply(texts.FORWARD_ASK, tuple(rows[:MAX_ROWS]))
+            return self._forward_choice(now=now, ui=self._ui(), staged=staged)
         except EffectAlreadyApplied:
             return self._replay_reply(now=now)
 
@@ -446,7 +1280,11 @@ class OwnerFlow(SchedulingCards):
                      source_key: str | None = None) -> Reply:
         payload = self._staged_payload(staged, ui)
         payload["pending_replace"] = incoming
-        payload["prev_state"] = str(ui.state)
+        # Updating a pending decision must not replace its collection origin
+        # with AWAIT_REPLACE: resolving it still belongs to the original edit
+        # destination (or creation), not to another replacement screen.
+        payload["prev_state"] = (ui.arg("prev_state", State.CREATING.value)
+                                 if ui.state is State.AWAIT_REPLACE else str(ui.state))
         self._state.set(State.AWAIT_REPLACE, payload,
                         expected_version=ui.version, now_epoch=now,
                         effect_key=source_key)
@@ -464,7 +1302,8 @@ class OwnerFlow(SchedulingCards):
         payload["pending_caption"] = {
             "text": text, "entities": entities_to_json(entities)
         }
-        payload["prev_state"] = str(ui.state)
+        payload["prev_state"] = (ui.arg("prev_state", State.CREATING.value)
+                                 if ui.state is State.AWAIT_REPLACE else str(ui.state))
         self._state.set(State.AWAIT_REPLACE, payload,
                         expected_version=ui.version, now_epoch=now,
                         effect_key=source_key)
@@ -472,6 +1311,7 @@ class OwnerFlow(SchedulingCards):
             (self._btn(texts.BTN_AS_CAPTION, self.A_CAPTION, now=now),),
             (self._btn(texts.BTN_REPLACE, self.A_REPLACE_YES, now=now),),
             (self._btn(texts.BTN_KEEP, self.A_REPLACE_KEEP, now=now),),
+            (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
         )
         return Reply(texts.CAPTION_ASK, rows)
 
@@ -481,6 +1321,23 @@ class OwnerFlow(SchedulingCards):
         idempotent answer rebuilt from the committed conversation — never a
         second effect, never a false conflict (PLAN §6 at-least-once)."""
         ui = self._ui()
+        if ui.state is State.CONFIRM_SCHEDULE:
+            hh, mm = ui.arg('manual_hh'), ui.arg('manual_mm')
+            return self._confirm_schedule_view(
+                now=now, post_id=ui.arg('post_id'), instant=Instant(ui.arg('minute_epoch')),
+                manual=(hh, mm) if hh is not None and mm is not None else None,
+                persist=False)
+        if ui.state is State.PUBLICATION:
+            return self._publication_view(now=now, pub_id=ui.arg('pub_id'), persist=False)
+        if ui.state is State.SETTINGS:
+            return self.settings_view(now=now, persist=False)
+        if ui.state is State.SETTINGS_INPUT:
+            return Reply(texts.SETTINGS_VALUE_ASK,
+                         ((self._btn(texts.BTN_BACK, self.A_SETTINGS, now=now),),))
+        if ui.state is State.DRAFT and ui.arg('schedule_picker'):
+            return self._schedule_picker(now=now, post_id=ui.arg('post_id'))
+        if ui.state is State.DRAFT and not ui.arg('hours'):
+            return self._draft_view(now=now, post_id=ui.arg('post_id'), persist=False)
         if ui.state is State.MANUAL_TIME and ui.arg('time_form'):
             return self._time_form_view(now=now)
         if ui.state is State.DRAFT and ui.arg('hours'):
@@ -495,6 +1352,7 @@ class OwnerFlow(SchedulingCards):
                     (self._btn(texts.BTN_AS_CAPTION, self.A_CAPTION, now=now),),
                     (self._btn(texts.BTN_REPLACE, self.A_REPLACE_YES, now=now),),
                     (self._btn(texts.BTN_KEEP, self.A_REPLACE_KEEP, now=now),),
+                    (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
                 ))
             if isinstance(ui.arg("pending_replace"), dict):
                 return Reply(texts.REPLACE_ASK, (
@@ -504,17 +1362,39 @@ class OwnerFlow(SchedulingCards):
                 ))
             return Reply(texts.REPLACE_ASK)
         if ui.state in (State.CREATING, State.EDITING):
+            if ui.arg('edit_mode') == 'choose':
+                return self._edit_mode_reply(now=now)
+            if ui.arg('edit_confirm'):
+                if self._approved_edit(ui) is None:
+                    return self._edit_review_retry(ui, now=now)
+                return Reply('Подтвердить изменения публикации?',
+                             self._staged_rows(ui, now, staged=self._staged(ui)))
             staged = self._staged(ui)
             if staged.kind == "forward":
-                rows = [
-                    (self._btn(texts.BTN_FORWARD_AS_IS, self.A_FORWARD_AS_IS,
-                               now=now),),
-                    (self._btn(texts.BTN_MAKE_COPY, self.A_FORWARD_COPY,
-                               now=now),),
-                ]
-                rows += list(self._staged_rows(ui, now, staged=staged))
-                return Reply(texts.FORWARD_ASK, tuple(rows[:MAX_ROWS]))
-            return self._staged_reply(now=now, staged=staged)
+                return self._forward_choice(now=now, ui=ui, staged=staged)
+            reply = self._staged_reply(now=now, staged=staged)
+            if (self._planned() or ui.arg('edit_mode')) and not staged.empty:
+                # Preserve a manual-split diagnostic and its undeleted input
+                # on redelivery too. This is pure validation, not preview I/O.
+                if self._planned() and not (ui.arg('edit_mode') and self._navigation is not None
+                        and self._navigation.lifecycle.prepared_review(f'staged:{ui.version}')):
+                    logical = self._candidate_logical(ui, staged)
+                    result = plan_post(logical, self._signature)
+                    if result.plan is None:
+                        return self._plan_blocked_reply(
+                            now=now, ui=ui, staged=staged, result=result, logical=logical)
+                # A delivery retry is not permission to retry private API
+                # effects. Offer an explicit, snapshot-bound presentation
+                # action instead, including after a failed control send.
+                if (self._navigation is not None
+                        and self._navigation.lifecycle.matches(f'staged:{ui.version}')):
+                    return replace(reply, staged_preview_version=None)
+                if ui.arg('edit_mode'):
+                    return self._edit_review_retry(ui, now=now)
+                return replace(reply, staged_preview_version=None,
+                               rows=((self._btn('Повторить предпросмотр',
+                                      self.A_STAGED_PREVIEW, now=now),),) + reply.rows)
+            return reply
         return self._menu_reply(now)
 
     def content_rejected(self, *, now: int,
@@ -528,6 +1408,9 @@ class OwnerFlow(SchedulingCards):
         return Reply(f"{texts.OVER_LIMITS_PREFIX}{exc}")
 
     def _staged_rows(self, ui: UiState, now: int, *, staged: Staged):
+        if ui.arg('edit_confirm'):
+            return ((self._btn(texts.BTN_CONFIRM, self.A_EDIT_CONFIRM, now=now),),
+                    (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),))
         rows = [
             (self._btn(texts.BTN_CONTINUE, self.A_CONTINUE, now=now),),
             (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
@@ -535,6 +1418,9 @@ class OwnerFlow(SchedulingCards):
         return tuple(rows)
 
     def _staged_reply(self, *, now: int, staged: Staged) -> Reply:
+        if self._ui().arg('native_plan'):
+            return replace(self._native_review_reply(now=now),
+                           staged_preview_version=self._ui().version)
         label, count = staged.summary()
         extra = ""
         if staged.kind == "album" and staged.ignored_group_items:
@@ -543,12 +1429,21 @@ class OwnerFlow(SchedulingCards):
             f"В посте: {label} ({count}). {texts.BTN_CONTINUE} — когда всё "
             f"придёт.{extra}",
             self._staged_rows(self._ui(), now, staged=staged),
+            staged_preview_version=self._ui().version if (
+                self._planned() or self._ui().arg('edit_mode')) else None,
         )
 
     async def _text_creating(self, *, now: int, ui: UiState, text: str,
                              entities: tuple[Entity, ...],
                              source_key: str | None = None) -> Reply:
         staged = self._staged(ui)
+        if (self._planned() or ui.arg('edit_mode')) and staged.kind != "forward":
+            try:
+                return await self._text_planned(now=now, ui=ui, staged=staged,
+                                                text=text, entities=entities,
+                                                source_key=source_key)
+            except ContentValidationError as exc:
+                return self.content_rejected(now=now, exc=exc)
         result = staged.add_text(text, entities)
         if result == "caption_possible":
             return self._caption_ask(now=now, ui=ui, staged=staged, text=text,
@@ -565,6 +1460,9 @@ class OwnerFlow(SchedulingCards):
     async def _text_editing(self, *, now: int, ui: UiState, text: str,
                             entities: tuple[Entity, ...],
                             source_key: str | None = None) -> Reply:
+        refusal = self._edit_input_refusal(ui, now=now, has_text=True, has_media=False)
+        if refusal is not None:
+            return refusal
         return await self._text_creating(now=now, ui=ui, text=text,
                                          entities=entities,
                                          source_key=source_key)
@@ -572,11 +1470,29 @@ class OwnerFlow(SchedulingCards):
     async def _text_await_replace(self, *, now: int, ui: UiState, text: str,
                                   entities: tuple[Entity, ...],
                                   source_key: str | None = None) -> Reply:
+        refusal = self._edit_input_refusal(ui, now=now, has_text=True, has_media=False)
+        if refusal is not None:
+            return refusal
         # While waiting for an explicit choice, more content just updates the
         # pending candidate — the decision buttons are re-offered, the old
         # staged content is untouched.
+        if self._planned():
+            # planned mode: an extra chunk APPENDS to what is already pending
+            # instead of replacing it (chunk 3 must not silently drop chunk 2)
+            payload = dict(ui.payload)
+            pending = payload.get("pending_replace")
+            base = (Staged.from_dict(pending) if isinstance(pending, dict)
+                    else self._staged(ui))
+            try:
+                intake.append_chunk(base, text, entities)
+            except ContentValidationError as exc:
+                return self.content_rejected(now=now, exc=exc)
+            return self._ask_replace(now=now, ui=ui, staged=self._staged(ui),
+                                     incoming=base.to_dict(),
+                                     source_key=source_key)
         incoming = copy_candidate_from_text(text, entities).to_dict()
         payload = dict(ui.payload)
+        payload.pop("pending_caption", None)
         payload["pending_replace"] = incoming
         self._state.set(ui.state, payload, expected_version=ui.version,
                         now_epoch=now, effect_key=source_key)
@@ -589,6 +1505,12 @@ class OwnerFlow(SchedulingCards):
     # ----------------------------------------------- continue / draft creation
     async def continue_pressed(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
+        # Pre-upgrade durable edits have no bound original/candidate review.
+        # They must be reopened, not silently committed via the legacy branch.
+        if ui.state is State.EDITING and not ui.arg('edit_mode'):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
+        if ui.arg('edit_mode') and not self._edit_target_current(ui):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
         if ui.state not in (State.CREATING, State.EDITING):
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
@@ -597,21 +1519,47 @@ class OwnerFlow(SchedulingCards):
             return Reply(
                 texts.NOTHING_STAGED, self._staged_rows(ui, now, staged=staged)
             )
+        if ui.arg('native_plan'):
+            if action.expected_version != ui.version:
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+            return await self._continue_native(now=now, ui=ui, action=action)
+        if staged.kind == 'forward' and ui.state is State.CREATING:
+            return self._forward_choice(now=now, ui=ui, staged=staged)
+        if ui.state is State.EDITING and staged.kind == 'forward':
+            return self._forward_choice(now=now, ui=ui, staged=staged)
+        if ui.state is State.EDITING and ui.arg('edit_mode'):
+            approved = self._approved_edit(ui)
+            if approved is None:
+                return self._edit_review_retry(ui, now=now)
+            if not ui.arg('edit_confirm'):
+                self._go(State.EDITING, dict(ui.payload, edit_confirm=True,
+                         edit_review_version=ui.version), now=now, expected_version=ui.version)
+                return Reply('Подтвердить изменения публикации?',
+                             self._staged_rows(self._ui(), now, staged=staged),
+                             staged_preview_version=self._ui().version)
+            if action.action != self.A_EDIT_CONFIRM:
+                return self._replay_reply(now=now)
+        if self._planned():
+            return await self._continue_planned(now=now, ui=ui, staged=staged)
         try:
-            content = staged.build()
+            content = self._candidate_content(ui, staged) if ui.arg('edit_mode') else staged.build()
         except ContentValidationError as exc:
             return Reply(f"{texts.OVER_LIMITS_PREFIX}{exc}",
                          self._staged_rows(ui, now, staged=staged))
         if ui.state is State.EDITING:
+            if ui.arg('edit_mode'):
+                content = Content.from_json(approved['content'])
             return self._commit_edit(now=now, ui=ui, content=content)
         post_id = self._drafts.create(content, now_epoch=now)
         self._journal.record("draft_created", post_id=post_id, now_epoch=now)
-        outcome = await self._preview.send_preview(content)
+        outcome = await self._send_preview(content, now=now)
         return self._draft_created_reply(now=now, post_id=post_id,
                                          outcome=outcome)
 
     def _commit_edit(self, *, now: int, ui: UiState, content: Content) -> Reply:
         target = ui.arg("target")
+        if ui.arg('edit_mode') and not self._edit_target_current(ui):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
         try:
             if target == "draft":
                 post_id = int(ui.arg("post_id"))
@@ -625,6 +1573,9 @@ class OwnerFlow(SchedulingCards):
             self._publications.edit_content(pub_id, expected_version, content,
                                             now_epoch=now)
         except (DraftNotFound, DomainError) as exc:
+            if ui.arg('edit_mode'):
+                return Reply(f'{texts.OP_FAILED_PREFIX}{exc}',
+                             self._staged_rows(ui, now, staged=self._staged(ui)))
             self._go(State.MENU, {}, now=now)
             return Reply(f"{texts.OP_FAILED_PREFIX}{exc}",
                          self._menu_reply(now).rows)
@@ -632,50 +1583,74 @@ class OwnerFlow(SchedulingCards):
                                       note=texts.EDIT_PAUSED_NOTE)
 
     def _draft_created_reply(self, *, now: int, post_id: int,
-                             outcome: PublishOutcome) -> Reply:
+                             outcome: PublishOutcome | None = None,
+                             plan: PublicationPlan | None = None) -> Reply:
         note = texts.DRAFT_SAVED
         if isinstance(outcome, Sent):
             note = f"{note} {texts.PREVIEW_SENT}"
-        else:
+        elif outcome is not None:
             code = getattr(outcome, "code", "api_error")
             reason = PREVIEW_FAIL_RU.get(code, code)
             note = f"{note} {texts.PREVIEW_FAILED_PREFIX}{reason}. {texts.PREVIEW_RETRY_HINT}"
-        return self._draft_view(now=now, post_id=post_id, note=note)
+        if isinstance(plan, PublicationPlan) and plan.diagnostics:
+            # non-blocking warnings (e.g. an over-long album kept to the
+            # first ten) are surfaced with the frozen plan, not swallowed
+            note = "\n".join([note] + [d.message for d in plan.diagnostics])
+        if outcome is None or isinstance(outcome, Sent):
+            reply = self._schedule_picker(now=now, post_id=post_id)
+            return replace(reply, text=f"{note}\n{reply.text}")
+        reply = self._draft_view(now=now, post_id=post_id, note=note)
+        self.review_delivery_failed(reply, now=now)
+        return reply
 
     # ------------------------------------------------------------- replace/copy
+    def _replacement_current(self, action: Action) -> bool:
+        ui = self._ui()
+        if ui.state is not State.AWAIT_REPLACE or action.expected_version != ui.version:
+            return False
+        if ui.arg('edit_mode') and not self._edit_target_current(ui):
+            return False
+        pending = ui.arg('pending_caption' if action.action == self.A_CAPTION
+                         else 'pending_replace')
+        return (isinstance(pending, dict) or
+                (action.action != self.A_CAPTION
+                 and isinstance(ui.arg('pending_caption'), dict)))
+
     def replace_yes(self, *, now: int, action: Action) -> Reply:
+        if not self._replacement_current(action):
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         ui = self._ui()
         incoming = ui.arg("pending_replace")
-        if ui.state is not State.AWAIT_REPLACE or not isinstance(incoming, dict):
-            self._go(State.MENU, {}, now=now)
-            return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
         prev = State(ui.arg("prev_state", State.CREATING.value))
         try:
+            if not isinstance(incoming, dict):
+                pending = ui.arg('pending_caption')
+                incoming = copy_candidate_from_text(
+                    str(pending.get('text', '')),
+                    entities_from_json(pending.get('entities', []))).to_dict()
             staged = Staged.from_dict(incoming)
         except ContentValidationError as exc:
             return Reply(f"{texts.OVER_LIMITS_PREFIX}{exc}",
                          self._staged_rows(ui, now, staged=self._staged(ui)))
-        self._state.set(prev, {"staged": staged.to_dict()},
+        self._state.set(prev, self._resolved_staged_payload(staged, ui, prev),
                         expected_version=ui.version, now_epoch=now)
         return self._staged_reply(now=now, staged=staged)
 
     def replace_keep(self, *, now: int, action: Action) -> Reply:
+        if not self._replacement_current(action):
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         ui = self._ui()
-        if ui.state is not State.AWAIT_REPLACE:
-            self._go(State.MENU, {}, now=now)
-            return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
         prev = State(ui.arg("prev_state", State.CREATING.value))
         staged = self._staged(ui)
-        self._state.set(prev, {"staged": staged.to_dict()},
+        self._state.set(prev, self._resolved_staged_payload(staged, ui, prev),
                         expected_version=ui.version, now_epoch=now)
         return self._staged_reply(now=now, staged=staged)
 
     def caption_yes(self, *, now: int, action: Action) -> Reply:
+        if not self._replacement_current(action):
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         ui = self._ui()
         pending = ui.arg("pending_caption")
-        if ui.state is not State.AWAIT_REPLACE or not isinstance(pending, dict):
-            self._go(State.MENU, {}, now=now)
-            return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
         prev = State(ui.arg("prev_state", State.CREATING.value))
         staged = self._staged(ui)
         try:
@@ -694,7 +1669,7 @@ class OwnerFlow(SchedulingCards):
                 (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
             )
             return Reply(CAPTION_AMBIGUOUS_RU, rows)
-        self._state.set(prev, {"staged": staged.to_dict()},
+        self._state.set(prev, self._resolved_staged_payload(staged, ui, prev),
                         expected_version=ui.version, now_epoch=now)
         return self._staged_reply(now=now, staged=staged)
 
@@ -702,25 +1677,53 @@ class OwnerFlow(SchedulingCards):
         ui = self._ui()
         staged = self._staged(ui)
         if ui.state not in (State.CREATING, State.EDITING) or staged.kind != "forward":
+            if self._planned():
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
+        if ui.state is State.EDITING:
+            if not self._planned():
+                return self._forward_choice(now=now, ui=ui, staged=staged)
+            if ui.arg('edit_mode') not in ('all', 'native') or not self._edit_target_current(ui):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+        if self._planned():
+            if action.expected_version != ui.version or self._navigation is None:
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+            try:
+                logical = OriginalForwardInput.from_accepted_messages(
+                    self._navigation.owner_id, tuple((staged.forward_chat_id, mid,
+                        staged.forward_group_id) for mid in staged.forward_ids))
+                plan = build_original_forward_plan(logical,
+                    owner_user_id=self._navigation.owner_id, channel_id=self._channel_id)
+            except ContentValidationError:
+                return replace(self._forward_choice(now=now, ui=ui, staged=staged),
+                    text='Невозможно подтвердить полный источник. Пришлите весь пост заново.',
+                    retain_input=True)
+            current = self._go(ui.state, dict(ui.payload, native_input=logical.to_json(),
+                native_plan=plan.to_json()), now=now, expected_version=ui.version)
+            return replace(self._native_review_reply(now=now),
+                           staged_preview_version=current.version)
         try:
             content = staged.build()
         except ContentValidationError as exc:
             return Reply(f"{texts.OVER_LIMITS_PREFIX}{exc}",
                          self._staged_rows(ui, now, staged=staged))
-        if ui.state is State.EDITING:
-            return self._commit_edit(now=now, ui=ui, content=content)
         post_id = self._drafts.create(content, now_epoch=now)
         self._journal.record("draft_created", post_id=post_id, now_epoch=now)
-        outcome = await self._preview.send_preview(content)
+        outcome = await self._send_preview(content, now=now)
         return self._draft_created_reply(now=now, post_id=post_id,
                                          outcome=outcome)
 
     def forward_copy(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
         staged = self._staged(ui)
+        if ui.arg('edit_mode') == 'native':
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if (self._planned() or ui.state is State.EDITING) and action.expected_version != ui.version:
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         if ui.state not in (State.CREATING, State.EDITING) or staged.kind != "forward":
+            if self._planned():
+                return Reply(texts.BUTTON_STALE, (), stale_callback=True)
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
         copy = staged.copy
@@ -731,14 +1734,28 @@ class OwnerFlow(SchedulingCards):
             # replacing durable coordinates or releasing any source to cleanup.
             if copy is None or copy.empty:
                 raise ContentValidationError("no editable copy")
-            content = copy.build()
-            retained = len(content.items) if content.kind == "album" else 1
-            if content.mode != "copy" or retained != len(staged.forward_ids):
-                raise ContentValidationError("incomplete editable copy")
+            if self._planned():
+                logical = intake.candidate_logical(copy)
+                retained = len(logical.media) if logical.media else 1
+                if retained != len(staged.forward_ids) or retained > intake.ALBUM_MAX:
+                    raise ContentValidationError("incomplete editable copy")
+                result = plan_post(logical, self._signature)
+                if result.plan is None:
+                    return self._plan_blocked_reply(now=now, ui=ui, staged=staged,
+                                                    result=result, logical=logical)
+                copy = intake.staged_from_logical(logical)
+            else:
+                content = copy.build()
+                retained = len(content.items) if content.kind == "album" else 1
+                if content.mode != "copy" or retained != len(staged.forward_ids):
+                    raise ContentValidationError("incomplete editable copy")
         except ContentValidationError:
+            if self._planned() or ui.state is State.EDITING:
+                reply = self._forward_choice(now=now, ui=ui, staged=staged)
+                return replace(reply, text=texts.FORWARD_COPY_UNAVAILABLE)
             rows = (
                 (self._btn(texts.BTN_FORWARD_AS_IS, self.A_FORWARD_AS_IS, now=now),),
-                (self._btn(texts.BTN_MAKE_COPY, self.A_FORWARD_COPY, now=now),),
+                (self._btn(self._copy_btn_label(), self.A_FORWARD_COPY, now=now),),
             ) + self._staged_rows(ui, now, staged=staged)
             return Reply(
                 "Невозможно создать полную редактируемую копию этого содержимого. "
@@ -751,9 +1768,13 @@ class OwnerFlow(SchedulingCards):
         # These coordinates come from durable intake, never callback data.
         # Validated file IDs/text now survive source deletion in explicit copy mode.
         released = tuple((int(staged.forward_chat_id), mid)
-                         for mid in staged.forward_ids)
-        return Reply(f"{texts.COPY_READY} {reply.text}", reply.rows,
-                     released_inputs=released)
+                         for mid in staged.forward_ids
+                         if not self.forward_source_referenced(
+                             chat_id=int(staged.forward_chat_id), message_id=mid))
+        retained_note = (" Источник сохранён: он может требоваться сохранённому посту."
+                         if len(released) != len(staged.forward_ids) else "")
+        return replace(reply, text=f"{texts.COPY_READY}{retained_note} {reply.text}",
+                       released_inputs=released)
 
     # ------------------------------------------------------------------- drafts
     def drafts_view(self, *, now: int, page: int) -> Reply:
@@ -767,10 +1788,12 @@ class OwnerFlow(SchedulingCards):
         for pid in ids[start:end]:
             try:
                 content = self._drafts.get_content(pid)
-                line = self._content_line(content)
             except DraftNotFound:
                 continue
-            rows.append((self._btn(f"№{pid} · {line}", self.A_DRAFT_SELECT,
+            # Plan-style title row (shared excerpt/icon helpers with the plan);
+            # unscheduled posts have no date, so none is fabricated here.
+            title = f"{icon_for(content.kind)} {summary(content)}"
+            rows.append((self._btn(f"№{pid} | {title}", self.A_DRAFT_SELECT,
                                    now=now, post_id=pid, expected_version=ui.version,
                                    arg=self._draft_snapshot(content)),))
         nav = []
@@ -812,12 +1835,14 @@ class OwnerFlow(SchedulingCards):
         return action.arg == self._draft_snapshot(content)
 
     async def draft_preview(self, *, now: int, post_id: int) -> Reply:
+        if self._planned():
+            return await self._planned_draft_preview(now=now, post_id=post_id)
         try:
             content = self._drafts.get_content(post_id)
         except DraftNotFound:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
-        outcome = await self._preview.send_preview(content)
+        outcome = await self._send_preview(content, now=now)
         if isinstance(outcome, Sent):
             note = texts.PREVIEW_SENT
         else:
@@ -832,15 +1857,10 @@ class OwnerFlow(SchedulingCards):
         except DraftNotFound:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
-        self._go(State.EDITING, {"target": "draft", "post_id": post_id,
-                                 "staged": Staged().to_dict()}, now=now)
-        return Reply(
-            texts.EDIT_ASK,
-            (
-                (self._btn(texts.BTN_CONTINUE, self.A_CONTINUE, now=now),),
-                (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
-            ),
-        )
+        if self._publications.get_by_post(post_id) is not None:
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
+        return self._start_component_edit(now=now, post_id=post_id,
+                     payload={'target': 'draft', 'post_id': post_id})
 
     def draft_delete_ask(self, *, now: int, post_id: int) -> Reply:
         try:
@@ -880,13 +1900,14 @@ class OwnerFlow(SchedulingCards):
         return kind
 
     def _draft_view(self, *, now: int, post_id: int,
-                    note: str | None = None) -> Reply:
+                    note: str | None = None, persist: bool = True) -> Reply:
         try:
             content = self._drafts.get_content(post_id)
         except DraftNotFound:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
-        self._go(State.DRAFT, {"post_id": post_id}, now=now)
+        if persist:
+            self._go(State.DRAFT, {"post_id": post_id}, now=now)
         line = self._content_line(content)
         text = f"Отложенный пост №{post_id}. Содержимое: {line}."
         if note:
@@ -894,16 +1915,13 @@ class OwnerFlow(SchedulingCards):
         rows = (
             (self._btn(texts.BTN_SCHEDULE, self.A_DRAFT_SCHEDULE, now=now,
                        post_id=post_id),),
-            (self._btn(texts.BTN_PREVIEW, self.A_DRAFT_PREVIEW, now=now,
-                       post_id=post_id, expected_version=self._ui().version,
-                       arg=self._draft_snapshot(content)),),
             (self._btn(texts.BTN_EDIT_CONTENT, self.A_DRAFT_EDIT, now=now,
                        post_id=post_id),),
             (self._btn(texts.BTN_DELETE, self.A_DRAFT_DELETE, now=now,
                        post_id=post_id),),
-            (self._btn(texts.BTN_BACK, self.A_BACK, now=now),),
+            (self._screen_back(texts.BTN_BACK, now=now),),
         )
-        return Reply(text, rows)
+        return Reply(text, rows, review_post_id=post_id)
     # ------------------------------------------------------------- scheduling
     def draft_schedule_ask(self, *, now: int, post_id: int) -> Reply:
         try:
@@ -918,6 +1936,8 @@ class OwnerFlow(SchedulingCards):
         return self._schedule_picker(now=now, post_id=post_id)
 
     def _schedule_picker(self, *, now: int, post_id: int) -> Reply:
+        if self._needs_forward_copy(post_id):
+            return self._saved_forward_copy_reply(now=now, post_id=post_id)
         ui = self._ui()
         if not (ui.state is State.DRAFT and ui.arg('post_id') == post_id
                 and ui.arg('schedule_picker')):
@@ -925,22 +1945,26 @@ class OwnerFlow(SchedulingCards):
                      now=now, expected_version=ui.version)
         settings = self._settings.get()
         rows = [
-            (self._btn(texts.BTN_NEXT_SLOT, self.A_SCHED_NEXT, now=now,
-                       post_id=post_id),),
-            (self._btn(texts.BTN_OWN_TIME, self.A_SCHED_OWN, now=now,
+            (self._btn(texts.BTN_DAY_SLOTS, self.A_SCHED_NEXT, now=now,
                        post_id=post_id),),
         ]
-        suggestions = recent_manual_suggestions(
-            self._manual_times.recent(limit=3), now, settings.timezone, limit=2
-        )
-        for sug in suggestions:
-            rows.append((self._btn(
-                f"{sug.hh:02d}:{sug.mm:02d} → {format_local(sug.instant, settings.timezone)}",
+        buttons = []
+        for instant, manual in self._schedule_candidates(now):
+            local = instant.local(settings.timezone)
+            buttons.append(self._btn(
+                f"{local:%H:%M} → {format_local(instant, settings.timezone)}",
                 self.A_SCHED_RECENT, now=now, post_id=post_id,
-                arg=f"{sug.hh}:{sug.mm}",
-            ),))
-        rows.append((self._btn(texts.BTN_BACK, self.A_BACK, now=now),))
-        return Reply(texts.PICK_TIME, tuple(rows[:MAX_ROWS]))
+                minute_epoch=instant.epoch,
+                arg=f'{manual[0]}:{manual[1]}' if manual else None))
+        rows.extend(tuple(buttons[i:i + 2]) for i in range(0, len(buttons), 2))
+        rows.append((self._screen_back(texts.BTN_BACK, now=now),))
+        note = ''
+        if not buttons:
+            note = '\nСвободных часов в пределах поиска нет. Укажите своё время.'
+        elif len(buttons) < 12:
+            note = '\nВ пределах поиска доступно меньше 12 вариантов. Можно указать своё время.'
+        return Reply(f'{texts.PICK_TIME} ({settings.timezone}){note}', tuple(rows),
+                     review_post_id=post_id)
 
     def sched_next(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
@@ -968,6 +1992,12 @@ class OwnerFlow(SchedulingCards):
             and ui.arg("post_id") == post_id
         )
         clock = parse_clock(action.arg or "")
+        if ok_state and action.minute_epoch is not None and post_id is not None:
+            instant = Instant(action.minute_epoch)
+            if instant.epoch <= now or instant.minute in self._publications.reserved_minutes():
+                return self._schedule_picker(now=now, post_id=post_id)
+            return self._confirm_schedule_view(now=now, post_id=post_id,
+                                               instant=instant, manual=clock)
         if not ok_state or clock is None or post_id is None:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.STEP_GONE, self._menu_reply(now).rows)
@@ -991,9 +2021,12 @@ class OwnerFlow(SchedulingCards):
         return Reply(text, tuple(rows))
 
     def _confirm_schedule_view(self, *, now: int, post_id: int, instant: Instant,
-                               manual: tuple[int, int] | None = None) -> Reply:
+                               manual: tuple[int, int] | None = None,
+                               persist: bool = True) -> Reply:
         try:
-            line = self._content_line(self._drafts.get_content(post_id))
+            if self._needs_forward_copy(post_id):
+                return self._saved_forward_copy_reply(now=now, post_id=post_id)
+            self._drafts.get_content(post_id)
         except DraftNotFound:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
@@ -1001,22 +2034,18 @@ class OwnerFlow(SchedulingCards):
         payload = {"post_id": post_id, "minute_epoch": instant.epoch}
         if manual is not None:
             payload["manual_hh"], payload["manual_mm"] = manual
-        self._go(State.CONFIRM_SCHEDULE, payload, now=now)
+        if persist:
+            self._go(State.CONFIRM_SCHEDULE, payload, now=now)
         token = self._token(self.A_CONFIRM, now=now, post_id=post_id,
                             minute_epoch=instant.epoch,
                             expected_version=self._ui().version)
         rows = (
             (Button(texts.BTN_CONFIRM, token),),
-            (self._btn(texts.BTN_OWN_TIME, self.A_SCHED_OWN, now=now,
-                       post_id=post_id),),
-            (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
+            (self._card_btn('Изменить дату', 'form_date', now=now),),
+            (self._screen_back(texts.BTN_CANCEL, now=now),),
         )
-        text = (
-            f"{texts.CONFIRM_SUMMARY_PREFIX}{line} — "
-            f"{format_local(instant, settings.timezone)} "
-            f"({settings.timezone}).\n{texts.CONFIRM_HINT}"
-        )
-        return Reply(text, rows)
+        text = texts.CONFIRM_SCHEDULE_LINE.format(when=instant.local(settings.timezone))
+        return Reply(text, rows, review_post_id=post_id)
 
     def confirm_schedule(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
@@ -1032,6 +2061,11 @@ class OwnerFlow(SchedulingCards):
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
         if minute <= now:
             return self._expired_time_confirmation(now=now, ui=ui, minute=minute)
+        if self._needs_forward_copy(post_id):
+            return self._saved_forward_copy_reply(now=now, post_id=post_id)
+        if not self._stored_plan_ready(post_id):
+            return self._draft_view(now=now, post_id=post_id,
+                note='Не удалось прочитать сохранённый план. Измените содержимое поста.')
         try:
             pub = self._publications.schedule(post_id, Instant(minute),
                                               now_epoch=now)
@@ -1048,10 +2082,10 @@ class OwnerFlow(SchedulingCards):
         hh, mm = ui.arg("manual_hh"), ui.arg("manual_mm")
         if isinstance(hh, int) and isinstance(mm, int):
             self._manual_times.record(hh, mm, now_epoch=now)
-        return self._publication_view(
+        return replace(self._publication_view(
             now=now, pub_id=pub.id,
             note=f"{texts.SCHEDULED_PREFIX}{self._pub_time_local(pub)}",
-        )
+        ), review_post_id=post_id)
 
     def _schedule_refusal_ru(self, exc: DomainError) -> str:
         if isinstance(exc, MinuteTakenError):
@@ -1125,13 +2159,11 @@ class OwnerFlow(SchedulingCards):
                             minute_epoch=instant.epoch, arg=f'ui:{self._ui().version}')
         rows = (
             (Button(texts.BTN_CONFIRM, token),),
-            (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
+            (self._card_btn('Изменить дату', 'form_date', now=now),),
+            (self._screen_back(texts.BTN_CANCEL, now=now),),
         )
-        text = (
-            f"{texts.CONFIRM_SUMMARY_PREFIX}{format_local(instant, settings.timezone)} "
-            f"({settings.timezone}).\n{texts.CONFIRM_HINT}"
-        )
-        return Reply(text, rows)
+        text = texts.CONFIRM_SCHEDULE_LINE.format(when=instant.local(settings.timezone))
+        return Reply(text, rows, review_post_id=self._publications.get(pub_id).post_id)
 
     def confirm_time_edit(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
@@ -1146,6 +2178,9 @@ class OwnerFlow(SchedulingCards):
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
         if minute <= now:
             return self._expired_time_confirmation(now=now, ui=ui, minute=minute)
+        copy_guard = self._publication_copy_guard(now=now, pub_id=pub_id)
+        if copy_guard is not None:
+            return copy_guard
         try:
             pub = self._publications.edit_time(pub_id, action.expected_version,
                                                Instant(minute), now_epoch=now)
@@ -1175,6 +2210,9 @@ class OwnerFlow(SchedulingCards):
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
         if minute <= now:
             return self._expired_time_confirmation(now=now, ui=ui, minute=minute)
+        copy_guard = self._publication_copy_guard(now=now, pub_id=pub_id)
+        if copy_guard is not None:
+            return copy_guard
         try:
             pub = self._publications.replan(pub_id, action.expected_version,
                                             Instant(minute), now_epoch=now)
@@ -1209,54 +2247,32 @@ class OwnerFlow(SchedulingCards):
 
     def _day_view(self, *, now: int, day: date, page: int,
                   note: str | None = None) -> Reply:
-        settings = self._settings.get()
-        start, end = day_bounds(day, settings.timezone)
-        pubs = self._publications.scheduled_between(start, end)
-        start_i, end_i, pages = page_window(len(pubs), page, size=DAY_PAGE_SIZE)
-        ui = self._go(State.MENU, {"view": "day"}, now=now)
-        rows = []
-        for pub in pubs[start_i:end_i]:
-            when = pub.scheduled_at.astimezone(ZoneInfo(settings.timezone)).strftime("%H:%M")
-            status = texts.status_marker(pub.status)
-            excerpt = summary(self._dispatch.content_for_publication(pub.id))
-            rows.append((self._btn(
-                f"{when} | {status} | {excerpt}",
-                self.A_PUB_OPEN, now=now, publication_id=pub.id,
-                expected_version=pub.version, arg=f'row:{ui.version}',
-            ),))
-        rows.extend(self._day_nav_rows(now=now, day=day, page=page,
-                                       pages=pages))
-        head = f"{texts.PLAN_DAY_PREFIX}{day.strftime('%d.%m.%Y')} " \
-               f"({settings.timezone})"
-        if not pubs:
-            body = texts.NO_PLANS_DAY
-        else:
-            body = f"{start_i + 1}–{end_i} из {len(pubs)}"
-        text = f"{head}: {body}."
-        if note:
-            text = f"{note}\n{text}"
-        return Reply(text, tuple(rows[:MAX_ROWS]))
+        self._go(State.MENU, {"view": "day", "day": day.isoformat(),
+                              "page": max(0, page)}, now=now)
+        reply = self.dashboard_reply(now=now, snapshot=self.dashboard_snapshot())
+        return replace(reply, text=f"{note}\n{reply.text}") if note else reply
 
     def _day_nav_rows(self, *, now: int, day: date, page: int, pages: int):
-        today_day = local_day(now, self._settings.get().timezone)
         day_iso = day.isoformat()
+        def button(label, action, **kwargs):
+            return self._btn(label, action, now=now,
+                             expected_version=self._ui().version, **kwargs)
+
         back_row: list[Button] = []
         if page > 0:
-            back_row.append(self._btn("↑ Сверху", self.A_DAY, now=now,
-                                      arg=f"{day_iso}:0"))
+            back_row.append(button("↑ Сверху", self.A_DAY, arg=f"{day_iso}:0"))
         if page < pages - 1:
-            back_row.append(self._btn(f"Ещё ↓ {page + 2}/{pages}", self.A_DAY,
-                                      now=now, arg=f"{day_iso}:{page + 1}"))
-        back_row.append(self._btn(texts.BTN_BACK, self.A_BACK, now=now))
+            back_row.append(button(f"Ещё ↓ {page + 2}/{pages}", self.A_DAY,
+                                   arg=f"{day_iso}:{page + 1}"))
         nav = (
-            self._btn("← Пред.", self.A_DAY, now=now,
-                      arg=f"{(day - timedelta(days=1)).isoformat()}:0"),
-            self._btn("Сегодня", self.A_DAY, now=now,
-                      arg=f"{today_day.isoformat()}:0"),
-            self._btn("След. →", self.A_DAY, now=now,
-                      arg=f"{(day + timedelta(days=1)).isoformat()}:0"),
+            button("← Пред.", self.A_DAY,
+                   arg=f"{(day - timedelta(days=1)).isoformat()}:0"),
+            button("Сегодня", self.A_PLAN),
+            button("След. →", self.A_DAY,
+                   arg=f"{(day + timedelta(days=1)).isoformat()}:0"),
         )
-        return (nav, tuple(back_row))
+        create = (button('Создать пост', self.A_NEW),)
+        return (nav, tuple(back_row), create) if back_row else (nav, create)
 
     def _last_permalink(self, post_id: int) -> str | None:
         links = self._dispatch.history_links(post_id)
@@ -1266,13 +2282,14 @@ class OwnerFlow(SchedulingCards):
 
     # ------------------------------------------------------ publication views
     def _publication_view(self, *, now: int, pub_id: int,
-                          note: str | None = None) -> Reply:
+                          note: str | None = None, persist: bool = True) -> Reply:
         try:
             pub = self._publications.get(pub_id)
         except DomainError:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
-        self._go(State.PUBLICATION, {"pub_id": pub_id}, now=now)
+        if persist:
+            self._go(State.PUBLICATION, {"pub_id": pub_id}, now=now)
         try:
             line = self._content_line(
                 self._dispatch.content_for_publication(pub_id))
@@ -1285,21 +2302,17 @@ class OwnerFlow(SchedulingCards):
         )
         text = f"{note}\n{head}" if note else head
         rows = self._pub_rows(now=now, pub=pub)
-        return Reply(text, rows)
+        return Reply(text, rows, review_post_id=(
+            None if pub.status is Status.SENDING else pub.post_id))
 
     def _pub_rows(self, *, now: int, pub) -> tuple[tuple[Button, ...], ...]:
         rows: list[tuple[Button, ...]] = []
         add = rows.append
         st = pub.status
-        if st in (Status.SCHEDULED, Status.SUSPENDED, Status.MISSED, Status.UNCERTAIN,
-                  Status.PUBLISHED):
-            add((self._btn(texts.BTN_PREVIEW, self.A_PUB_PREVIEW, now=now,
-                           publication_id=pub.id, expected_version=pub.version),))
-        if st is Status.SCHEDULED:
-            add((self._btn(texts.BTN_PAUSE, self.A_PUB_PAUSE, now=now,
-                           publication_id=pub.id, expected_version=pub.version),))
+        if st in (Status.SCHEDULED, Status.SUSPENDED, Status.MISSED):
             add((self._btn(texts.BTN_EDIT_CONTENT, self.A_PUB_EDIT_CONTENT,
-                           now=now, publication_id=pub.id),))
+                           now=now, publication_id=pub.id, expected_version=pub.version),))
+        if st is Status.SCHEDULED:
             add((self._btn(texts.BTN_EDIT_TIME, self.A_PUB_EDIT_TIME, now=now,
                            publication_id=pub.id, expected_version=pub.version),))
         if st is Status.SUSPENDED:
@@ -1326,7 +2339,7 @@ class OwnerFlow(SchedulingCards):
             add((self._btn(texts.BTN_TO_DRAFTS, self.A_TO_DRAFT_RISK, now=now,
                            publication_id=pub.id,
                            expected_version=pub.version),))
-        add((self._btn(texts.BTN_BACK, self.A_BACK, now=now),))
+        add((self._screen_back(texts.BTN_BACK, now=now),))
         return tuple(rows[:MAX_ROWS])
 
     def _pub_time_local(self, pub) -> str:
@@ -1340,11 +2353,13 @@ class OwnerFlow(SchedulingCards):
     async def pub_preview(self, *, now: int, pub_id: int) -> Reply:
         # Read the actual payload bound to this publication.
         # No claim, scheduling mutation or source cleanup belongs in this path.
+        if self._planned():
+            return await self._planned_pub_preview(now=now, pub_id=pub_id)
         try:
             content = self._dispatch.content_for_publication(pub_id)
         except DomainError:
             return Reply(texts.BUTTON_STALE, (), stale_callback=True)
-        outcome = await self._preview.send_preview(content)
+        outcome = await self._send_preview(content, now=now)
         if isinstance(outcome, Sent):
             note = texts.PREVIEW_SENT
         else:
@@ -1367,24 +2382,20 @@ class OwnerFlow(SchedulingCards):
     def pub_edit_content(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
         pub_id = int(action.publication_id)
-        if ui.state is not State.PUBLICATION or ui.arg("pub_id") != pub_id:
-            self._go(State.MENU, {}, now=now)
-            return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
+        if (ui.state is not State.PUBLICATION or ui.arg("pub_id") != pub_id
+                or action.arg != f'ui:{ui.version}'):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
         try:
             pub = self._publications.get(pub_id)
         except DomainError:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.NOT_FOUND, self._menu_reply(now).rows)
-        self._go(State.EDITING, {"target": "pub", "pub_id": pub_id,
-                                 "expected_version": pub.version,
-                                 "staged": Staged().to_dict()}, now=now)
-        return Reply(
-            texts.EDIT_ASK,
-            (
-                (self._btn(texts.BTN_CONTINUE, self.A_CONTINUE, now=now),),
-                (self._btn(texts.BTN_CANCEL, self.A_BACK, now=now),),
-            ),
-        )
+        if (pub.version != action.expected_version or pub.status not in
+                (Status.SCHEDULED, Status.SUSPENDED, Status.MISSED)):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
+        return self._start_component_edit(now=now, post_id=pub.post_id,
+                     payload={'target': 'pub', 'pub_id': pub_id,
+                              'expected_version': pub.version})
 
     def pub_edit_time(self, *, now: int, action: Action) -> Reply:
         ui = self._ui()
@@ -1392,12 +2403,18 @@ class OwnerFlow(SchedulingCards):
         if ui.state is not State.PUBLICATION or ui.arg("pub_id") != pub_id:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
+        copy_guard = self._publication_copy_guard(now=now, pub_id=pub_id)
+        if copy_guard is not None:
+            return copy_guard
         return self._start_time_form(now=now, payload={
             "purpose": "edit_time", "pub_id": pub_id,
             "expected_version": int(action.expected_version)})
 
     def pub_resume(self, *, now: int, action: Action) -> Reply:
         pub_id = int(action.publication_id)
+        copy_guard = self._publication_copy_guard(now=now, pub_id=pub_id)
+        if copy_guard is not None:
+            return copy_guard
         try:
             self._publications.resume(pub_id, int(action.expected_version),
                                       now_epoch=now)
@@ -1463,6 +2480,9 @@ class OwnerFlow(SchedulingCards):
         if ui.state is not State.PUBLICATION or ui.arg("pub_id") != pub_id:
             self._go(State.MENU, {}, now=now)
             return Reply(texts.BUTTON_STALE, self._menu_reply(now).rows)
+        copy_guard = self._publication_copy_guard(now=now, pub_id=pub_id)
+        if copy_guard is not None:
+            return copy_guard
         return self._start_time_form(now=now, payload={
             "purpose": "replan", "pub_id": pub_id,
             "expected_version": int(action.expected_version)})
@@ -1587,9 +2607,10 @@ class OwnerFlow(SchedulingCards):
         menu = self._menu_reply(now)
         return Reply(f"{texts.TO_DRAFTS_DONE}\n{menu.text}", menu.rows)
     # ---------------------------------------------------------------- settings
-    def settings_view(self, *, now: int) -> Reply:
+    def settings_view(self, *, now: int, persist: bool = True) -> Reply:
         current = self._settings.get()
-        self._go(State.SETTINGS, {}, now=now)
+        if persist:
+            self._go(State.SETTINGS, {}, now=now)
         text = (
             f"{texts.TITLE_SETTINGS}:\n"
             f"{texts.SET_TZ_LABEL}: {current.timezone}\n"
@@ -1688,14 +2709,15 @@ class OwnerFlow(SchedulingCards):
     # ---------------------------------------------------------------- journal
     def journal_view(self, *, now: int, page: int) -> Reply:
         total = self._journal.total()
-        start, end, pages = page_window(total, page)
+        start, end, pages = page_window(total, page, size=JOURNAL_PAGE_SIZE)
         lines = [self._journal_line(row)
-                 for row in self._journal.entries_page(start, PAGE_SIZE)]
+                 for row in self._journal.entries_page(start, JOURNAL_PAGE_SIZE)]
         if lines:
             text = f"{texts.TITLE_JOURNAL} ({start + 1}–{end} из {total}):\n" \
                    + "\n".join(lines)
         else:
             text = f"{texts.TITLE_JOURNAL}: {texts.NO_JOURNAL}"
+        self._go(State.MENU, {"view": "journal"}, now=now)
         nav = []
         if page > 0:
             nav.append(self._btn("← Пред.", self.A_JOURNAL, now=now,
@@ -1704,7 +2726,6 @@ class OwnerFlow(SchedulingCards):
             nav.append(self._btn("След. →", self.A_JOURNAL, now=now,
                                  arg=f"p{page + 1}"))
         nav.append(self._btn(texts.BTN_BACK, self.A_BACK, now=now))
-        self._go(State.MENU, {"view": "journal"}, now=now)
         return Reply(text, (tuple(nav),))
 
     def _journal_line(self, row) -> str:
@@ -1717,6 +2738,7 @@ class OwnerFlow(SchedulingCards):
             detail = json.loads(row["detail"] or "{}")
         except json.JSONDecodeError:
             detail = {}
+        parts.insert(0, event_marker(row['kind'], detail))
         if isinstance(detail, dict):
             for name in ("outcome", "code", "reason_code", "keys_changed"):
                 value = detail.get(name)
@@ -1734,6 +2756,28 @@ class OwnerFlow(SchedulingCards):
         return " · ".join(parts)
 
     # ------------------------------------------------------------ press routing
+    def _screen_action_current(self, action: Action) -> bool:
+        """UI capabilities remain bound across callback acknowledgement I/O.
+
+        Publication row versions are a separate contract: minute-change
+        confirmations carry their conversation version in ``arg`` instead.
+        """
+        ui = self._ui()
+        if action.action in (self.A_REPLACE_YES, self.A_REPLACE_KEEP, self.A_CAPTION):
+            return self._replacement_current(action)
+        if action.action == self.A_BACK and (action.arg or '').startswith('state:'):
+            return (action.expected_version == ui.version
+                    and action.arg == f'state:{ui.state.value}')
+        if action.action in CARD_ACTIONS | {self.A_SCHED_NEXT, self.A_SCHED_OWN,
+                                            self.A_SCHED_RECENT, self.A_CONFIRM}:
+            return action.expected_version == ui.version
+        if action.action in (self.A_CONFIRM_TIME_EDIT, self.A_CONFIRM_REPLAN):
+            return action.arg == f'ui:{ui.version}'
+        if (action.action in (self.A_DAY, self.A_PLAN, self.A_BACK, self.A_NEW)
+                and action.expected_version is not None):
+            return self.dashboard_current(action.expected_version)
+        return True
+
     async def press(self, *, now: int, token: str,
                     on_consumed: Callable[[], Awaitable[None]] | None = None,
                     refresh_now: Callable[[], int] | None = None) -> Reply:
@@ -1742,22 +2786,37 @@ class OwnerFlow(SchedulingCards):
         except ActionStale:
             return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         ui = self._ui()
+        if action.action == self.A_DRAFT_EDIT:
+            if (ui.state is not State.DRAFT or ui.arg('post_id') != action.post_id
+                    or action.expected_version != ui.version):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+        if action.action in (self.A_EDIT_MODE, self.A_EDIT_CONFIRM) or (
+                action.action in (self.A_CONTINUE, self.A_BACK)
+                and action.expected_version is not None and ui.arg('edit_mode')):
+            if action.expected_version != ui.version:
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+        if not self._screen_action_current(action):
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         if action.action == self.A_PUB_OPEN and action.expected_version is not None:
             if (action.arg != f'row:{ui.version}' or ui.state is not State.MENU
                     or ui.arg('view') not in (None, 'day')):
                 return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if (action.action == self.A_FORWARD_AS_IS and self._planned()
+                and action.expected_version != self._ui().version):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
             try:
                 pub = self._publications.get(action.publication_id)
             except DomainError:
                 return Reply(texts.BUTTON_STALE, (), stale_callback=True)
             if pub.version != action.expected_version:
                 return Reply(texts.BUTTON_STALE, (), stale_callback=True)
-        if (ui.arg('time_form') or ui.arg('hours')) and action.action not in CARD_ACTIONS:
+        if (ui.arg('time_form') or ui.arg('hours')) and action.action not in CARD_ACTIONS | {self.A_REVIEW_RETRY}:
             # Inline buttons from an older screen cannot replace a live card.
             # The persistent reply keyboard still navigates via menu_navigation.
             return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         if action.action in CARD_ACTIONS | {self.A_SCHED_NEXT, self.A_SCHED_OWN,
-                                           self.A_SCHED_RECENT, self.A_CONFIRM}:
+                                           self.A_SCHED_RECENT, self.A_CONFIRM,
+                                            self.A_STAGED_PREVIEW, self.A_REVIEW_RETRY}:
             if action.expected_version != self._ui().version:
                 return Reply(texts.BUTTON_STALE, (), stale_callback=True)
         if action.action in (self.A_CONFIRM_TIME_EDIT, self.A_CONFIRM_REPLAN):
@@ -1795,10 +2854,50 @@ class OwnerFlow(SchedulingCards):
 
     async def _run_action(self, *, now: int, action: Action) -> Reply:
         kind = action.action
+        if not self._screen_action_current(action):
+            return Reply(texts.BUTTON_STALE, (), stale_callback=True)
+        if (kind in (self.A_CONTINUE, self.A_BACK) and self._ui().arg('edit_mode')
+                and action.expected_version != self._ui().version):
+            return Reply(texts.BUTTON_STALE, stale_callback=True)
+        if kind == self.A_EDIT_MODE:
+            ui = self._ui()
+            if (ui.state is not State.EDITING or ui.arg('edit_mode') != 'choose'
+                    or action.expected_version != ui.version
+                    or action.arg not in ('text', 'attachment', 'all', 'native')
+                    or (action.arg == 'native' and not ui.arg('edit_native'))
+                    or not self._edit_target_current(ui)):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+            self._go(State.EDITING, dict(ui.payload, edit_mode=action.arg),
+                     now=now, expected_version=ui.version)
+            return Reply('Пришлите новый текст целиком.' if action.arg == 'text'
+                         else 'Пришлите все новые вложения без подписей.' if action.arg == 'attachment'
+                         else texts.ASK_CONTENT,
+                         self._staged_rows(self._ui(), now, staged=Staged()))
+        if kind == self.A_EDIT_CONFIRM:
+            ui = self._ui()
+            if (ui.state is not State.EDITING or not ui.arg('edit_confirm')
+                    or action.expected_version != ui.version
+                    or not self._edit_target_current(ui)):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+            return await self.continue_pressed(now=now, action=action)
+        if kind == self.A_REVIEW_RETRY:
+            if (action.expected_version != self._ui().version
+                    or action.post_id is None
+                    or action.arg != self._review_snapshot(action.post_id)):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+            if self._navigation is not None:
+                self._navigation.lifecycle.set_review_failure(None, now=now)
+            return replace(self._replay_reply(now=now), review_post_id=action.post_id)
+        if kind == self.A_STAGED_PREVIEW:
+            ui = self._ui()
+            if (ui.state not in (State.CREATING, State.EDITING, State.AWAIT_REPLACE)
+                    or action.expected_version != ui.version):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
+            return self._staged_reply(now=now, staged=self._staged(ui))
         if kind in (self.A_DRAFT_SELECT, self.A_DRAFT_PREVIEW):
             if not self._draft_preview_valid(action):
                 return Reply(texts.BUTTON_STALE, (), stale_callback=True)
-            return await self.draft_preview(now=now, post_id=action.post_id)
+            return self._draft_view(now=now, post_id=action.post_id)
         if kind in (self.A_PUB_OPEN, self.A_PUB_PREVIEW) and action.expected_version is not None:
             # The acknowledgement itself awaited network I/O. Recheck the
             # capability before sending content if the publication changed.
@@ -1832,6 +2931,9 @@ class OwnerFlow(SchedulingCards):
         if kind == self.A_MENU:
             return await self.command_start(now=now)
         if kind == self.A_NEW:
+            if (action.expected_version is not None
+                    and not self.dashboard_current(action.expected_version)):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
             return await self.new_post(now=now)
         if kind == self.A_CONTINUE:
             return await self.continue_pressed(now=now, action=action)
@@ -1852,6 +2954,10 @@ class OwnerFlow(SchedulingCards):
         if kind == self.A_DRAFT_PREVIEW and action.post_id is not None:
             return await self.draft_preview(now=now, post_id=action.post_id)
         if kind == self.A_DRAFT_EDIT and action.post_id is not None:
+            ui = self._ui()
+            if (ui.state is not State.DRAFT or ui.arg('post_id') != action.post_id
+                    or action.expected_version != ui.version):
+                return Reply(texts.BUTTON_STALE, stale_callback=True)
             return self.draft_edit_start(now=now, post_id=action.post_id)
         if kind == self.A_DRAFT_DELETE and action.post_id is not None:
             return self.draft_delete_ask(now=now, post_id=action.post_id)
@@ -1885,9 +2991,9 @@ class OwnerFlow(SchedulingCards):
             # Leave the dashboard before awaiting the preview, so its periodic
             # refresh cannot publish a competing menu card during this action.
             self._go(State.PUBLICATION, {"pub_id": pub.id}, now=now)
-            return await self.pub_preview(now=now, pub_id=pub.id)
+            return self._publication_view(now=now, pub_id=pub.id)
         if kind == self.A_PUB_PREVIEW and action.publication_id is not None:
-            return await self.pub_preview(now=now, pub_id=action.publication_id)
+            return self._publication_view(now=now, pub_id=action.publication_id)
         if kind == self.A_PUB_PAUSE and action.publication_id is not None:
             return self.pub_pause(now=now, action=action)
         if kind == self.A_PUB_EDIT_CONTENT and action.publication_id is not None:
@@ -1919,8 +3025,33 @@ class OwnerFlow(SchedulingCards):
         if kind == self.A_JOURNAL:
             return self.journal_view(now=now, page=self._page_of(action.arg))
         if kind == self.A_BACK:
-            self._state.reset_to_menu(now_epoch=now)
-            return self._menu_reply(now)
+            ui = self._ui()
+            sources = set()
+
+            def collect(value):
+                if isinstance(value, dict):
+                    if value.get('kind') == 'forward':
+                        sources.update((value['forward_chat_id'], mid)
+                                       for mid in value.get('forward_ids', []))
+                    for child in value.values():
+                        collect(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        collect(child)
+
+            if ui.state in (State.EDITING, State.AWAIT_REPLACE) and ui.arg('target'):
+                collect(ui.payload)
+            if ui.state in (State.EDITING, State.AWAIT_REPLACE) and ui.arg('target') == 'draft':
+                reply = self._draft_view(now=now, post_id=ui.arg('post_id'))
+            elif ui.state in (State.EDITING, State.AWAIT_REPLACE) and ui.arg('target') == 'pub':
+                reply = self._publication_view(now=now, pub_id=ui.arg('pub_id'))
+            else:
+                self._state.reset_to_menu(now_epoch=now)
+                reply = self._menu_reply(now)
+            released = tuple(sorted((chat_id, mid) for chat_id, mid in sources
+                                    if not self.forward_source_referenced(
+                                        chat_id=chat_id, message_id=mid)))
+            return replace(reply, released_inputs=released)
         return Reply(texts.BUTTON_STALE, (), stale_callback=True)
 
     @staticmethod

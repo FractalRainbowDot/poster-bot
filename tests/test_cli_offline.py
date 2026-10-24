@@ -32,6 +32,34 @@ def env_file(tmp_path):
 
 
 class TestCheck:
+    @pytest.mark.parametrize("use_env_file", [False, True])
+    def test_raw_quoted_signature_passes_check(self, tmp_path, monkeypatch, use_env_file):
+        # Both Compose's process environment and our raw KEY=VALUE CLI reader
+        # preserve the outer quotes; neither may prevent startup.
+        values = {
+            "POSTER_BOT_BOT_TOKEN": SECRET,
+            "POSTER_BOT_OWNER_USER_ID": "111",
+            "POSTER_BOT_CHANNEL_ID": "-100555",
+            "POSTER_BOT_DB_PATH": str(tmp_path / "quoted.sqlite3"),
+            "POSTER_BOT_LOCK_PATH": str(tmp_path / "quoted.lock"),
+            "POSTER_BOT_SIGNATURE_MAIN_TEXT": '"Главный канал"',
+            "POSTER_BOT_SIGNATURE_MAIN_URL": "https://t.me/main",
+            "POSTER_BOT_SIGNATURE_PARTNER_TEXT": '"@канал партнера"',
+            "POSTER_BOT_SIGNATURE_PARTNER_URL": "https://t.me/partner",
+        }
+        path = None
+        if use_env_file:
+            path = tmp_path / "raw-label-env"
+            path.write_text("".join(f"{key}={value}\n" for key, value in values.items()),
+                            encoding="utf-8")
+        else:
+            for key, value in values.items():
+                monkeypatch.setenv(key, value)
+        result = _run("check", env_file=path)
+        assert result.returncode == 0, result.stderr
+        assert "config is fit for live mode" in result.stdout
+        assert SECRET not in result.stdout + result.stderr
+
     def test_check_accepts_username_channel_offline(self, tmp_path):
         """@username-канал проходит офлайн-проверку без Telegram-сети (Phase B)."""
         path = tmp_path / "env-username"

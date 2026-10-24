@@ -7,16 +7,17 @@ decision is testable offline without aiogram types.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from .dashboard import Dashboard
+from .dashboard import DayFrame
 
 #: Telegram hard limit for message texts
 TEXT_MAX = 4096
-#: Application guard, not a Telegram hard limit: twelve single-column planned
-#: entries plus Journal. Paginated draft/day lists keep their smaller page size.
+#: Application guard, not a Telegram hard limit: day entries and navigation.
 MAX_ROWS = 13
 #: draft/journal list entries per page
 PAGE_SIZE = 6
-#: content-plan publications per day page (independent of the main dashboard).
+#: journal audit entries per page (independent of draft-list pagination).
+JOURNAL_PAGE_SIZE = 20
+#: content-plan publications per day page, including the home screen.
 DAY_PAGE_SIZE = 10
 
 
@@ -45,9 +46,17 @@ class Reply:
     # Server-owned received sources released by an explicit persisted copy.
     # Adapter additionally checks owner chat and durable intake receipt.
     released_inputs: tuple[tuple[int, int], ...] = ()
-    # Main-card identity metadata; never used to change business state.
-    dashboard: Dashboard | None = None
+    # Day-plan identity metadata; never used to change business state.
+    dashboard: DayFrame | None = None
     dashboard_version: int | None = None
+    # Send the stored frozen stack before publishing these fresh controls.
+    review_post_id: int | None = None
+    # Ephemeral preview reads ONLY the durable staged snapshot at this version.
+    staged_preview_version: int | None = None
+    # Durable intake may be retained while the planner asks for manual repair.
+    retain_input: bool = False
+    # Terminal wrong-stage forward only; adapter may safely reject AFTER delivery.
+    rejected_forward: bool = False
 
     def __post_init__(self) -> None:
         if len(self.text) > TEXT_MAX:

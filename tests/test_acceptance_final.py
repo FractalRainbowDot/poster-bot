@@ -61,18 +61,20 @@ def build_runtime(services, channel: FakeTransport) -> Runtime:
 
 
 def _schedule(flow, created, *, now: int = NOW, own_time: str | None = None):
-    """Slot or manual-time confirmation; returns the scheduled reply."""
-    picker = press_label(flow, created, texts.BTN_SCHEDULE, now=now)
+    """Nearest free hour or manual-time confirmation; returns the reply."""
+    picker = created  # Continue opens the time picker directly.
     if own_time is None:
-        confirm = press_label(flow, picker, texts.BTN_NEXT_SLOT, now=now)
-        hour = next(button.label for row in confirm.rows for button in row
-                    if re.fullmatch(r'\d{2}:00', button.label))
-        confirm = press_label(flow, confirm, hour, now=now)
+        hour = next(button.label for row in picker.rows for button in row
+                    if re.fullmatch(r'\d{2}:00 → \d{2}\.\d{2}\.\d{4} \d{2}:00',
+                                    button.label))
+        confirm = press_label(flow, picker, hour, now=now)
     else:
-        press_label(flow, picker, texts.BTN_OWN_TIME, now=now)
-        confirm = run(flow.text(now=now, text=own_time))
-        confirm = press_label(flow, confirm, 'Продолжить', now=now)
-        assert confirm.text.startswith(texts.CONFIRM_SUMMARY_PREFIX)
+        expected = datetime.strptime(own_time, "%d.%m.%Y %H:%M")
+        time_reply = run(flow.text(now=now, text=expected.strftime("%H:%M")))
+        press_label(flow, time_reply, "Изменить дату", now=now)
+        confirm = run(flow.text(now=now, text=expected.strftime("%d-%m-%Y")))
+        assert confirm.text == expected.strftime(
+            "❗ Публикация будет запланирована на %H:%M %d.%m.%Y ❗")
     scheduled = press_label(flow, confirm, texts.BTN_CONFIRM, now=now)
     assert scheduled.text.startswith(texts.SCHEDULED_PREFIX)
     return scheduled
@@ -91,7 +93,8 @@ def _journey(services, stage, *, finish=texts.BTN_CONTINUE, own_time=None):
     created = press_label(flow, staged, finish, now=NOW)
     assert texts.DRAFT_SAVED in created.text
     assert texts.PREVIEW_SENT in created.text
-    post_id = _post_id(created.text)
+    post_id = flow._ui().arg("post_id")
+    assert services.drafts.is_draft(post_id)
     content = services.drafts.get_content(post_id)
     # the preview went to the owner path; the channel path stayed untouched
     assert len(preview.owner_previews) == 1
@@ -162,13 +165,19 @@ class TestFullJourneyPerKind:
         run(flow.new_post(now=NOW))
         staged = run(flow.text(now=NOW, text="первый занят"))
         created = press_label(flow, staged, texts.BTN_CONTINUE, now=NOW)
+        post_id = flow._ui().arg("post_id")
         _schedule(flow, created)
-        pub = services.publications.get_by_post(_post_id(created.text))
+        pub = services.publications.get_by_post(post_id)
         assert pub.status is Status.SCHEDULED
         rival = services.drafts.create(text_content("соперник"), now_epoch=NOW)
         with pytest.raises(MinuteTakenError):
             services.publications.schedule(
                 rival, Instant(pub.minute_epoch), now_epoch=NOW)
+        # Bypass the UI's free-hour filtering deliberately: the real
+        # reservation service must reject this exact already-reserved minute.
+        assert services.publications.get_by_post(rival) is None
+        assert services.publications.get(pub.id).status is Status.SCHEDULED
+        assert services.publications.get(pub.id).minute_epoch == pub.minute_epoch
 
 
 class TestAlbumAndForwardCarryCaptions:
@@ -225,7 +234,7 @@ class TestAlbumAndForwardCarryCaptions:
                                  copy_candidate=second))
         copied = press_label(flow, ask, texts.BTN_MAKE_COPY, now=NOW)
         created = press_label(flow, copied, texts.BTN_CONTINUE, now=NOW)
-        content = services.drafts.get_content(_post_id(created.text))
+        content = services.drafts.get_content(flow._ui().arg("post_id"))
         assert content.kind == "album"
         assert [i.caption for i in content.items] == ["cap1", "cap2"]
         shown = preview.owner_previews[0]
@@ -262,13 +271,19 @@ class TestEditPauseNoSend:
         run(flow.new_post(now=NOW))
         staged = run(flow.text(now=NOW, text="до правки"))
         created = press_label(flow, staged, texts.BTN_CONTINUE, now=NOW)
+        post_id = flow._ui().arg("post_id")
         _schedule(flow, created)
-        pub = services.publications.get_by_post(_post_id(created.text))
+        pub = services.publications.get_by_post(post_id)
         day = flow.plan_today(now=NOW)
         view = press_label(flow, day, " | 🕒 | до правки", now=NOW)
-        press_label(flow, view, texts.BTN_EDIT_CONTENT, now=NOW)
+        modes = press_label(flow, view, texts.BTN_EDIT_CONTENT, now=NOW)
+        press_label(flow, modes, texts.BTN_EDIT_TEXT, now=NOW)
         staged2 = run(flow.text(now=NOW, text="после правки"))
-        done = press_label(flow, staged2, texts.BTN_CONTINUE, now=NOW)
+        from ui_flow_helpers import present_reply
+        staged2 = run(present_reply(flow, staged2, now=NOW))
+        confirmation = press_label(flow, staged2, texts.BTN_CONTINUE, now=NOW)
+        assert services.publications.get(pub.id) == pub
+        done = press_label(flow, confirmation, texts.BTN_CONFIRM, now=NOW)
         assert texts.EDIT_PAUSED_NOTE in done.text
         assert services.publications.get(pub.id).status is Status.SUSPENDED
         # the minute arrives while paused: nothing may go out
@@ -292,23 +307,27 @@ class TestConsumeFirstPreviewLoss:
     exactly-once redelivery of the effect), retry works from the draft."""
 
     def test_failed_preview_keeps_draft_token_spent_retry_ok(self, services):
-        flow, preview = build_flow(services)
+        from test_ui_handlers_offline import _Harness
+        from test_ui_publication_preview import callback
+
+        h = _Harness(services)
+        flow, preview = h.flow, h.preview
         preview.preview_script = [UncertainOutcome("timeout")]
-        run(flow.new_post(now=NOW))
-        staged = run(flow.text(now=NOW, text="не потерян"))
-        token = find_token(staged, texts.BTN_CONTINUE)
-        done = press(flow, token, now=NOW)
-        assert texts.DRAFT_SAVED in done.text
-        assert texts.PREVIEW_FAILED_PREFIX in done.text
-        assert texts.PREVIEW_RETRY_HINT in done.text
+        h.message(text=texts.MENU_NEW_POST)
+        h.message(text="не потерян", message_id=40)
+        token = h._button_data(texts.BTN_CONTINUE)
+        callback(h, token)
+        assert texts.DRAFT_SAVED in h.last_text()
+        assert "Повторить предпросмотр" in h.last_labels()
         post_ids = services.drafts.list_drafts()
         assert len(post_ids) == 1  # the draft committed before the failure
         assert services.drafts.get_content(post_ids[0]).text == "не потерян"
-        stale = press(flow, token, now=NOW + 5)
-        assert stale.text == texts.BUTTON_STALE
+        callback(h, token)
+        assert h.session.requests[-1][1]["text"] == texts.BUTTON_STALE
         assert services.drafts.list_drafts() == post_ids  # still exactly one
-        retried = press_label(flow, done, texts.BTN_PREVIEW, now=NOW + 10)
-        assert texts.PREVIEW_SENT in retried.text
+        h.press_text("Повторить предпросмотр")
+        assert "Повторить предпросмотр" not in h.last_labels()
+        assert texts.BTN_PREVIEW not in h.last_labels()
         # the fake transport records attempts, not deliveries: both calls
         # are visible, only the second one reached the owner chat
         assert len(preview.owner_previews) == 2

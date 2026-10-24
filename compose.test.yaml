@@ -1,0 +1,45 @@
+# Standalone LOCAL TEST deployment. Never used by production and never an
+# override of compose.yaml: this project, image, container and volume are all
+# separate from `poster-bot` / `poster-bot-data`.
+#
+# Manual start only. `docker compose -f compose.test.yaml up -d bot` starts the
+# one local test poller; `... stop bot` stops it without deleting the DB.
+name: poster-bot-test
+
+services:
+  bot:
+    image: poster-bot:test
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Runtime injection only; .env is never baked into the image.
+    env_file:
+      - path: .env
+        format: raw
+    # Force the test database/lock onto the dedicated test volume, overriding
+    # any host paths present in .env.
+    environment:
+      POSTER_BOT_DB_PATH: /app/data/poster_bot_test.sqlite3
+      POSTER_BOT_LOCK_PATH: /app/data/poster_bot_test.lock
+    volumes:
+      - test-data:/app/data
+    user: "10001:10001"
+    init: true
+    restart: "no"
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  test-data:
+    name: poster-bot-test-data

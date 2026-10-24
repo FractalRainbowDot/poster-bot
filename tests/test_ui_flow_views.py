@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pytest
 
-from conftest import NOW, text_content
+from conftest import NOW, future, text_content
 from ui_flow_helpers import build_flow, labels, press_label, run
 
 from poster_bot.domain.states import Status
@@ -36,7 +36,8 @@ class TestDayPlan:
         for page in range(10):
             rows = [row[0].label for row in view.rows if " | " in row[0].label]
             assert len(rows) == 10
-            assert len(view.rows) == 12  # entries and both navigation rows survive
+            assert len(view.rows) == 13  # entries, day/page navigation, create
+            assert "Создать пост" in labels(view) and texts.BTN_BACK not in labels(view)
             assert f"{page * 10 + 1}–{(page + 1) * 10} из 100" in view.text
             seen.extend(label.rsplit(" | ", 1)[1] for label in rows)
             if page < 9:
@@ -148,7 +149,7 @@ class TestDayPlan:
         for page in range(2):
             post_rows = [row for row in view.rows if " | 🕒 | " in row[0].label]
             assert all(len(row) == 1 for row in post_rows)
-            assert len(view.rows) == (12 if page == 0 else 5)
+            assert len(view.rows) == (13 if page == 0 else 6)
             seen.extend(row[0].label for row in post_rows)
             if page < 1:
                 view = press_label(flow, view, "Ещё ↓", now=NOW)
@@ -187,6 +188,138 @@ class TestDayPlan:
         assert services.drafts.get_content(pid).text == original
 
 
+class TestDeferredList:
+    """Отложенное: plan-style single-column rows, deferred-only membership."""
+
+    def _reach(self, flow, view, needle, *, now):
+        return press_label(flow, view, needle, now=now)
+
+    def test_multiple_deferred_posts_render_as_plan_style_single_column_rows(
+            self, services):
+        flow, preview = build_flow(services)
+        pid_text = services.drafts.create(text_content("weekly digest draft"),
+                                          now_epoch=NOW)
+        pid_photo = services.drafts.create(
+            Content(kind="photo", media=MediaRef("photo", "fake", "photo caption")),
+            now_epoch=NOW)
+        pid_fwd = services.drafts.create(
+            Content(kind="forward", mode="forward",
+                    forward=ForwardSource(-100555, (42,))), now_epoch=NOW)
+        view = flow.drafts_view(now=NOW, page=0)
+        post_rows = [row for row in view.rows if row[0].label.startswith("№")]
+        assert len(post_rows) == 3
+        assert all(len(row) == 1 for row in post_rows)  # single column
+        by_label = {row[0].label: row[0] for row in post_rows}
+        assert f"№{pid_text} | 📝 weekly digest draft" in by_label
+        assert f"№{pid_photo} | 📷 photo caption" in by_label
+        assert f"№{pid_fwd} | ↪️ Пересылка источника" in by_label
+        for label, button in by_label.items():
+            assert button.token  # clickable server-issued callback row
+            assert ":" not in label and "🕒" not in label  # no fabricated date
+        # the list never embeds detail/action blocks inline
+        flat = labels(view)
+        assert not {"Запланировать", "Предпросмотр", "Редактировать содержимое",
+                    "Удалить"} & set(flat)
+        assert "Содержимое:" not in view.text
+        assert preview.calls == [] and preview.owner_previews == []
+
+    @pytest.mark.parametrize("status", list(Status))
+    def test_every_publication_status_is_excluded_deferred_is_unplanned_only(
+            self, services, status):
+        flow, _ = build_flow(services)
+        control = services.drafts.create(text_content("true deferred"),
+                                         now_epoch=NOW)
+        when = NOW + 600
+        pid = services.drafts.create(text_content(f"status-{status.value}"),
+                                     now_epoch=NOW)
+        pub = services.publications.schedule(pid, Instant(when), now_epoch=NOW)
+        if status is Status.SUSPENDED:
+            services.publications.pause(pub.id, pub.version, now_epoch=NOW)
+        elif status not in (Status.SCHEDULED, Status.SUSPENDED):
+            attempt = services.dispatch.claim(pub.id, pub.version, now_epoch=when)
+            if status is not Status.SENDING:
+                services.dispatch.mark_in_progress(attempt, now_epoch=when)
+            if status is Status.PUBLISHED:
+                services.dispatch.complete(pub.id, attempt, (999,),
+                                           "https://t.me/c/555/999", now_epoch=when)
+            elif status is Status.UNCERTAIN:
+                services.dispatch.mark_uncertain(pub.id, attempt, "timeout",
+                                                 now_epoch=when)
+            elif status is Status.MISSED:
+                services.dispatch.fail_definitive(pub.id, attempt, "api_error",
+                                                  now_epoch=when)
+        view = flow.drafts_view(now=NOW, page=0)
+        post_labels = [row[0].label for row in view.rows
+                       if row[0].label.startswith("№")]
+        # published/missed/uncertain history must not leak into Отложенное
+        assert post_labels == [f"№{control} | 📝 true deferred"]
+        assert "1–1 из 1" in view.text
+
+    def test_scheduling_removes_from_deferred_and_postponement_returns_it(
+            self, services):
+        flow, _ = build_flow(services)
+        pid = services.drafts.create(text_content("postponed back"),
+                                     now_epoch=NOW)
+        assert any(l.startswith(f"№{pid} |") for l in
+                   labels(flow.drafts_view(now=NOW, page=0)))
+        pub = services.publications.schedule(pid, future(120), now_epoch=NOW)
+        assert texts.NO_DRAFTS in flow.drafts_view(now=NOW, page=0).text
+        # the existing cancel-to-draft path ("В отложенное") returns it
+        services.publications.cancel_to_draft(pub.id, pub.version, now_epoch=NOW)
+        view = flow.drafts_view(now=NOW, page=0)
+        assert any(l == f"№{pid} | 📝 postponed back" for l in labels(view))
+        assert services.drafts.get_content(pid).text == "postponed back"
+
+    def test_empty_deferred_keeps_back_button_only(self, services):
+        flow, _ = build_flow(services)
+        view = flow.drafts_view(now=NOW, page=0)
+        assert view.text == texts.NO_DRAFTS
+        assert labels(view) == [texts.BTN_BACK]
+
+    def test_page_bounds_and_plan_style_rows_survive_pagination(self, services):
+        flow, _ = build_flow(services)
+        pids = [services.drafts.create(text_content(f"deferred-{i:02d}"),
+                                       now_epoch=NOW) for i in range(13)]
+        page1 = flow.drafts_view(now=NOW, page=0)
+        assert "1–6 из 13" in page1.text and len(page1.rows) == 7
+        page2 = self._reach(flow, page1, "След. →", now=NOW)
+        assert "7–12 из 13" in page2.text and len(page2.rows) == 7
+        page3 = self._reach(flow, page2, "След. →", now=NOW)
+        assert "13–13 из 13" in page3.text
+        assert page3.rows[0][0].label == f"№{pids[0]} | 📝 deferred-00"
+        assert not any(l.startswith("След. →") for l in labels(page3))
+        assert "← Пред." in labels(page3)
+        back = self._reach(flow, page3, "← Пред.", now=NOW)
+        assert "7–12 из 13" in back.text
+
+    def test_long_text_excerpt_truncated_like_plan_without_touching_payload(
+            self, services):
+        flow, _ = build_flow(services)
+        original = "long\n\u202e" + "text" * 900
+        pid = services.drafts.create(text_content(original), now_epoch=NOW)
+        label = flow.drafts_view(now=NOW, page=0).rows[0][0].label
+        assert label.startswith(f"№{pid} | 📝 long text")
+        assert label.endswith("…") and len(label) <= 100
+        assert "\n" not in label and "\u202e" not in label
+        assert services.drafts.get_content(pid).text == original
+
+    def test_row_selection_still_sends_private_preview_and_keeps_detail(self,
+                                                                        services):
+        flow, preview = build_flow(services)
+        pid = services.drafts.create(text_content("selected deferred"),
+                                     now_epoch=NOW)
+        view = flow.drafts_view(now=NOW, page=0)
+        detail = self._reach(flow, view, f"№{pid} |", now=NOW)
+        assert preview.owner_previews == []  # presentation, not flow.press, sends
+        detail, complete = run(flow.review_reply(detail, now=NOW))
+        assert complete
+        assert [c.text for c in preview.owner_previews] == ["selected deferred"]
+        assert preview.calls == []  # the channel path is never used for previews
+        assert f"Отложенный пост №{pid}." in detail.text
+        assert set(labels(detail)) == {texts.BTN_SCHEDULE, texts.BTN_EDIT_CONTENT,
+                                       texts.BTN_DELETE, texts.BTN_BACK}
+
+
 class TestJournal:
     def test_draft_list_keeps_six_entries_per_page(self, services):
         flow, _ = build_flow(services)
@@ -201,13 +334,13 @@ class TestJournal:
 
     def test_pagination_and_no_post_contents(self, services):
         flow, _ = build_flow(services)
-        for i in range(9):
+        for i in range(21):
             pid = services.drafts.create(text_content(), now_epoch=NOW)
             services.journal.record("draft_created", post_id=pid, now_epoch=NOW)
         page1 = flow.journal_view(now=NOW, page=0)
-        assert f"{texts.TITLE_JOURNAL} (1–6 из 9)".rstrip(":") in page1.text
+        assert f"{texts.TITLE_JOURNAL} (1–20 из 21)".rstrip(":") in page1.text
         page2 = press_label(flow, page1, "След. →", now=NOW)
-        assert "7–9 из 9" in page2.text
+        assert "21–21 из 21" in page2.text
         # journal lines carry no post contents
         assert "hello owner" not in page1.text + page2.text
 

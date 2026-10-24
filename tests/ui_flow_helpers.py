@@ -20,6 +20,8 @@ def build_flow(
     *,
     channel_id: int = FLOW_CHANNEL,
     channel_username: str | None = None,
+    signature=None,
+    plans=None,
 ) -> tuple[OwnerFlow, FakeTransport]:
     """OwnerFlow over the test services; previews go to the same fake
     transport so tests can prove the channel publish path is never used.
@@ -27,12 +29,19 @@ def build_flow(
     ``channel_username`` mirrors the live composition: the numeric channel id
     stays the destination, the bare/@-prefixed username only upgrades links.
     ``channel_id`` overrides the fake channel (guard tests pass invalid
-    targets explicitly)."""
+    targets explicitly).
+
+    ``signature`` (a SignatureConfig) switches the flow into the planned
+    pipeline; the PlanStore is built over the same connection unless one is
+    passed explicitly. Without it every legacy behaviour stays identical."""
 
     services.settings.seed_defaults(SimpleNamespace(
         timezone="Europe/Moscow", slot_start_hour=0, slot_end_hour=23,
     ))
     preview = FakeTransport()
+    if signature is not None and plans is None:
+        from poster_bot.repo.plans import PlanStore
+        plans = PlanStore(services.conn)
     flow = OwnerFlow(
         conn=services.conn,
         settings=services.settings,
@@ -44,12 +53,27 @@ def build_flow(
         preview=preview,
         channel_id=channel_id,
         channel_username=channel_username,
+        signature=signature,
+        plans=plans,
     )
     return flow, preview
 
 
 def run(coro: Any):
     return asyncio.run(coro)
+
+
+async def present_reply(flow: OwnerFlow, reply, *, now: int, owner_id: int = 1):
+    """Direct-flow tests explicitly complete the real presentation boundary.
+
+    FakeTransport sends the content; successful controls are simulated only
+    here, using the same central promotion as the offline Dispatcher.
+    """
+    lifecycle = flow.navigation_store(owner_id).lifecycle
+    reply, complete = await flow.review_reply(reply, now=now)
+    if complete:
+        lifecycle.presented(keep_preview=flow.preview_context(), now=now)
+    return reply
 
 
 def tokens(reply) -> dict[str, str]:
